@@ -5,6 +5,9 @@ addons (`steamapps/workshop/content/220`) and your `custom/` folders, and report
 
 | Section | Meaning |
 |---|---|
+| **Addons that do nothing** | Every file is overwritten by an addon that loads ahead of it, or is an exact copy of a file another addon provides. Safe to remove; they're checked together, so you can remove all of them at once. |
+| **Addons that mostly do nothing** | At least half the files are overwritten or duplicated. They still change something. |
+| **Addon pairs with the most conflicts** | Which addons fight the most, and which one wins. |
 | **Conflicts** | Two addons ship the same file with **different** contents. The game only uses one, so the other addon is partly broken. |
 | `[!]` conflicts | The file is in `scripts/`, `resource/`, `cfg/` or `maps/`: weapon scripts, sound scripts, UI and maps. These are the most likely to break gameplay. |
 | `[MODEL]` conflicts | A model whose `.mdl`/`.vvd`/`.vtx`/`.phy` parts may come from different addons. Mixed parts give invisible or distorted models, or crashes. |
@@ -37,6 +40,9 @@ Use `--offline` to skip that and show item IDs instead.
 | `--limit N` | Entries per section on screen, 0 = all (default 25). The file always has everything. |
 | `--min-dupe-size N` | Smallest file in bytes checked for content duplicates (default 1024) |
 | `--offline` | Don't look up Workshop titles |
+| `--load-order FILE` | The game's `workshop.txt`, if it isn't found automatically |
+| `--last-wins` | The addon lower in `workshop.txt` wins conflicts |
+| `--all` | Also check disabled addons and ones missing from `workshop.txt` |
 
 The exit code is 2 when conflicts were found and 0 when none were.
 
@@ -50,8 +56,21 @@ The exit code is 2 when conflicts were found and 0 when none were.
 If a Workshop item uses a format the tool doesn't recognize, the report lists it under
 **Problems reading addons**, with the file's first bytes, so support can be added.
 
-**Limitation:** the tool can tell you *that* two addons fight over a file, but not *which one wins*.
-That depends on the game's addon load order.
+## Load order
+
+The game keeps your Workshop addons' load order in
+`steamapps/common/Half-Life 2/hl2_complete/cfg/workshop.txt`: one line per addon, in load order,
+`1` = enabled and `0` = disabled. The tool reads it automatically, or use `--load-order FILE`.
+
+- Conflicts show which copy is `<- used`, and each addon's position in the list as `[#N]`.
+- Disabled addons, and installed addons that aren't in the list yet, are skipped (listed at the end).
+  The game only updates the list when it starts, so launch it once after subscribing to something.
+  `--all` checks them anyway, as if they were enabled.
+- **Which end of the list wins is assumed: the addon higher in the list (smaller `#N`).**
+  If the game turns out to work the other way, use `--last-wins`.
+  To check: find a conflict in the report where you can tell the addons apart in game
+  (a map or a weapon model), see which one you get, and compare their `#N`.
+- `custom/` addons aren't in the list, so conflicts involving them show no winner.
 
 ## Source SDK version (optional)
 
