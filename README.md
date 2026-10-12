@@ -158,11 +158,12 @@ The game keeps your Workshop addons' load order in
 
 ```sh
 python -m unittest tests.test_addon_checker -v
+python -m unittest tests.test_addon_organizer -v    # opens windows; on Linux without a desktop: xvfb-run -a ...
 ```
 
 The tests build fake addons (loose folders, plain and compressed VPKs, broken ones) and fake Steam
-libraries, and check what the checker makes of them. CI runs them on Linux and Windows with
-Python 3.7 and the newest Python.
+libraries, and check what the checker makes of them; the organizer tests drive the real window on
+them. CI runs both on Linux and Windows with Python 3.7 and the newest Python.
 
 ## Source SDK version (optional)
 
