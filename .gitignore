@@ -44,3 +44,4 @@ luac.out
 /addon_checker
 addon_report.txt
 __pycache__/
+addon_rules.json

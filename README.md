@@ -46,6 +46,36 @@ Use `--offline` to skip that and show item IDs instead.
 
 The exit code is 2 when conflicts were found and 0 when none were.
 
+## Organizer window
+
+```sh
+python addon_organizer.py
+```
+
+A mod-organizer-style window for your Workshop load order. Needs `addon_checker.py` in the same
+folder; tkinter comes with the python.org installer on Windows.
+
+- **Load order list:** every addon with its position, on/off state, files, how many conflicts it
+  **wins** and **loses**, and a status: *does nothing*, *mostly nothing (N%)*, *rule broken*,
+  *disabled*, or *not in workshop.txt yet*.
+- **Reorder:** drag rows, or use Top / Up / Down / Bottom (works on several selected rows).
+  Double-click or Space turns an addon on or off.
+- **Conflicts tab:** for the selected addon, every addon it clashes with and how many files it wins,
+  loses or shares identically. Expand a row for the file list, or double-click it to jump to that addon.
+  `[!]` marks scripts, UI, cfg and map conflicts.
+- **Rules:** in the Conflicts tab, pick *This addon should win* or *The other should win*.
+  Rules are saved in `addon_rules.json` next to the tool. **Sort by rules** fixes every broken rule
+  by moving each rule's winner to just ahead of its loser, leaving everything else where it was.
+  Rules that go in a circle are reported instead.
+- **Move removable addons to the losing end:** moves every addon that does nothing to the end of
+  the list where it loses. The game plays the same, and they end up together in the game's
+  Add-ons screen for unsubscribing.
+- **Files tab:** every file in the addon and whether the game uses it, or which addon overwrites it.
+- **Lower in the list wins:** flips the assumed load order direction (saved with your rules).
+- **Save load order** writes `workshop.txt`, after backing the old one up as
+  `workshop.txt.<date>-<time>.bak`. **Close the game first**, since it may rewrite the file.
+  *Undo changes* goes back to the last saved order.
+
 ## What it reads
 
 - **Workshop items:** each item folder is one addon. The VPKs inside are read whether they're plain or compressed. Supported compression: LZMA (standard and Valve's `LZMA` header), xz, gzip, bzip2, zlib, and zip files containing VPKs. Loose files in an item folder are read too.

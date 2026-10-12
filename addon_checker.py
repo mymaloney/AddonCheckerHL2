@@ -304,11 +304,15 @@ def parent_name(path):
     return os.path.basename(os.path.dirname(path))
 
 
-def scan(containers):
+def print_progress(i, total):
+    print("\rReading addon %d/%d..." % (i, total), end="" if i < total else "\n", file=sys.stderr, flush=True)
+
+
+def scan(containers, progress=print_progress):
     addons = collect_addons(containers)
     total = len(addons)
     for i, (addon, kind) in enumerate(addons, 1):
-        print("\rReading addon %d/%d..." % (i, total), end="", file=sys.stderr, flush=True)
+        progress(i, total)
         if kind == "folder":
             scan_folder_addon(addon, addon.location)
         else:
@@ -319,8 +323,6 @@ def scan(containers):
                 addon.errors.append(str(e))
         # Files at the addon root (addoninfo.txt...) and caches aren't game content.
         addon.files = {p: v for p, v in addon.files.items() if "/" in p and not is_cache(p)}
-    if total:
-        print(file=sys.stderr)
     return [a for a, _ in addons]
 
 
@@ -410,6 +412,17 @@ def read_load_order(path):
     with open(path, encoding="utf-8", errors="replace") as f:
         text = f.read()
     return [(m.group(1), m.group(2) != "0") for m in re.finditer(r'"(\d+)"\s+"(\d+)"', text)]
+
+
+def write_load_order(path, entries):
+    """Writes workshop.txt in the game's own format. entries: [(id, enabled)] in load order."""
+    lines = ['"AddonInfo"', "{"]
+    lines += ['\t"%s"\t\t"%d"' % (wsid, 1 if enabled else 0) for wsid, enabled in entries]
+    lines += ["}", ""]
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8", newline="\r\n" if sys.platform == "win32" else "\n") as f:
+        f.write("\n".join(lines))
+    os.replace(tmp, path)
 
 
 def find_hl2_addon_folders():
@@ -504,11 +517,16 @@ def find_idle_addons(addons, by_path):
     return removed, results
 
 
-def analyze(addons, min_dupe_size):
+def index_files(addons):
     by_path = defaultdict(list)  # path -> [(addon, size, crc)]
     for addon in addons:
         for path, (size, crc) in addon.files.items():
             by_path[path].append((addon, size, crc))
+    return by_path
+
+
+def analyze(addons, min_dupe_size):
+    by_path = index_files(addons)
 
     conflicts, same_path = [], []
     for path, copies in sorted(by_path.items()):
