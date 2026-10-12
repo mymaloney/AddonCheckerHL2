@@ -5,13 +5,14 @@ addons (`steamapps/workshop/content/220`) and your `custom/` folders, and report
 
 | Section | Meaning |
 |---|---|
-| **Addons that do nothing** | Every file is overwritten by an addon that loads ahead of it, or is an exact copy of a file another addon provides. Safe to remove; they're checked together, so you can remove all of them at once. |
+| **Addons that do nothing** | Every file is overwritten by an addon that loads ahead of it, or is an exact copy of a file another addon provides. Safe to remove all at once. Some are only safe together with others (marked *only together with*): removing one of those alone changes the game. Addons that couldn't be fully read are never listed here. |
 | **Addons with copies of base game files** | Files identical to the game's own. They change nothing, unless they win over another addon's version and so put the original back. Conflicts mark such copies `[same as base game]`. |
 | **Addons that mostly do nothing** | At least half the files are overwritten or duplicated. They still change something. |
 | **Addon pairs with the most conflicts** | Which addons fight the most, and which one wins. |
 | **Conflicts** | Two addons ship the same file with **different** contents. The game only uses one, so the other addon is partly broken. |
 | `[!]` conflicts | The file is in `scripts/`, `resource/`, `cfg/` or `maps/`: weapon scripts, sound scripts, UI and maps. These are the most likely to break gameplay. |
-| `[MODEL]` conflicts | A model whose `.mdl`/`.vvd`/`.vtx`/`.phy` parts may come from different addons. Mixed parts give invisible or distorted models, or crashes. |
+| `[MODEL]` conflicts | The file is part of a model (`models/`). |
+| **Models built from different addons** | The game takes each part of a model (`.mdl`, `.vvd`, `.dx90.vtx`, `.phy`, `.ani`) from the first addon that has it, so a model can end up made of different addons' parts, even when no single file conflicts (e.g. one addon adds a `.phy` to another addon's model). Mismatched parts give invisible or distorted models, or crashes. Parts from the original game aren't counted, since a reskin can legitimately ship only a hex-edited `.mdl`. |
 | **Same-path duplicates** | Same file, identical contents, in several addons. Harmless. |
 | **Content duplicates** | Identical file contents under different names in different addons. Harmless, just wasted space. |
 
@@ -23,10 +24,15 @@ You need [Python 3.7+](https://www.python.org/downloads/). No extra packages.
 python addon_checker.py
 ```
 
-That finds Steam and every Steam library folder by itself, then scans:
+That finds your Half-Life 2 install through Steam by itself, then scans what the game loads:
 
-- `steamapps/workshop/content/220/`
-- every `custom/` folder in Half-Life 2 (`hl2/custom`, `episodic/custom`, `ep2/custom`, …)
+- the Workshop folder in the same Steam library (`steamapps/workshop/content/220/`)
+- the `custom/` folders listed in the game's `gameinfo.txt` (or `hl2_complete`, `ep2`, `episodic`
+  and `hl2/custom` if it can't be read). Other games in the Half-Life 2 folder, like Lost Coast,
+  have their own `custom/` folders, which Half-Life 2 doesn't load.
+
+If an old install left folders in another Steam library, they're ignored: the game doesn't load them.
+The folders used are printed at the start; use `--game-dir` or pass folders to pick others.
 
 On Windows you can also double-click `addon_checker.py`; the window stays open until you press Enter.
 
@@ -45,8 +51,10 @@ Use `--offline` to skip that and show item IDs instead.
 | `--last-wins` | The addon lower in `workshop.txt` wins conflicts |
 | `--find TEXT` | Only list files matching `TEXT` (e.g. `d1_town_02`, `maps/d1_town_*`) and what each addon does with them |
 | `--all` | Also check disabled addons and ones missing from `workshop.txt` |
+| `--game-dir FOLDER` | The Half-Life 2 folder to use, if the right one isn't found automatically |
 
-The exit code is 2 when conflicts were found and 0 when none were.
+The exit code is 2 when conflicts or mixed models were found, 0 when none were, and 1 when
+something went wrong (a folder or `--load-order` file that can't be opened, a report that can't be saved).
 
 ## Organizer window
 
@@ -107,13 +115,14 @@ Rules, notes, profiles, theme and window layout are kept in `addon_rules.json` n
 
 ## What it reads
 
-- **Workshop items:** each item folder is one addon. The VPKs inside are read whether they're plain or compressed. Supported compression: LZMA (standard and Valve's `LZMA` header), xz, gzip, bzip2, zlib, and zip files containing VPKs. Loose files in an item folder are read too.
+- **Workshop items:** each item folder (named by its id) is one addon. Anything else in the Workshop folder, like an Explorer copy `1234 - Copy` or a VPK put there by hand, is listed as *not Workshop items*: the game never loads it. The VPKs inside an item are read whether they're plain or compressed. Supported compression: LZMA (standard and Valve's `LZMA` header), xz, gzip, bzip2, zlib, and zip files containing VPKs. Loose files in an item folder are read too.
 - **`custom/` addons:** sub-folders (loose files, plus a `pak01_dir.vpk` inside), single `foo.vpk` files, and multi-part `foo_dir.vpk` + `foo_000.vpk`…
 - VPK contents are never extracted. The tool compares the CRC32 values each VPK stores for its files, so even gigabytes of addons scan quickly.
 - Files at an addon's root (`addoninfo.txt`, preview images…) are ignored, since they aren't game content.
 
 If a Workshop item uses a format the tool doesn't recognize, the report lists it under
-**Problems reading addons**, with the file's first bytes, so support can be added.
+**Problems reading addons**, with the file's first bytes, so support can be added. Addons with
+problems are never reported as doing nothing, since the part that couldn't be read may matter.
 
 ## Base game files
 
@@ -137,12 +146,23 @@ The game keeps your Workshop addons' load order in
 - Conflicts show which copy is `<- used`, and each addon's position in the list as `[#N]`.
 - Disabled addons, and installed addons that aren't in the list yet, are skipped (listed at the end).
   The game only updates the list when it starts, so launch it once after subscribing to something.
-  `--all` checks them anyway, as if they were enabled.
+- `--all` checks them anyway, as if they were enabled; only the addons the game really loads decide
+  which addons do nothing, though.
 - **Which end of the list wins is assumed: the addon higher in the list (smaller `#N`).**
   If the game turns out to work the other way, use `--last-wins`.
   To check: find a conflict in the report where you can tell the addons apart in game
   (a map or a weapon model), see which one you get, and compare their `#N`.
 - `custom/` addons aren't in the list, so conflicts involving them show no winner.
+
+## Tests
+
+```sh
+python -m unittest tests.test_addon_checker -v
+```
+
+The tests build fake addons (loose folders, plain and compressed VPKs, broken ones) and fake Steam
+libraries, and check what the checker makes of them. CI runs them on Linux and Windows with
+Python 3.7 and the newest Python.
 
 ## Source SDK version (optional)
 

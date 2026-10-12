@@ -5,6 +5,27 @@ on:
   pull_request:
 
 jobs:
+  # The Python checker and organizer. 3.7 is the oldest version the README promises.
+  python:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-22.04, python: "3.7" }
+          - { os: ubuntu-latest, python: "3.13" }
+          - { os: windows-latest, python: "3.7" }
+          - { os: windows-latest, python: "3.13" }
+    env:
+      PYTHONDONTWRITEBYTECODE: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Checker tests
+        run: python -m unittest tests.test_addon_checker -v
+
   linux:
     runs-on: ubuntu-latest
     strategy:
