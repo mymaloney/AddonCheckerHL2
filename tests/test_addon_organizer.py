@@ -24,7 +24,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 try:
     import tkinter as tk
-    from tkinter import messagebox
+    from tkinter import messagebox, simpledialog
     import addon_checker as ac
     import addon_organizer as ao
 except ImportError as e:
@@ -792,7 +792,7 @@ class OrganizerTest(unittest.TestCase):
         app = self.open()
         self.click("custom:" + os.path.join(self.game, "hl2", "custom_disabled", "mymod"), col="on")
         self.pump()
-        self.assertTrue(any("already has one" in d[2] for d in self.dialogs))
+        self.assertTrue(any("already there" in d[2] for d in self.dialogs))
         self.assertTrue(os.path.isfile(os.path.join(self.game, "hl2", "custom", "mymod", "materials", "custom",
                                                     "c.vtf")))
         self.assertTrue(app.addon_for_key("custom:" + os.path.join(self.game, "hl2", "custom_disabled",
@@ -851,7 +851,7 @@ class OrganizerTest(unittest.TestCase):
         self.assertFalse(os.path.exists(os.path.join(self.tmp, "outside.txt")))
         message = [d[2] for d in self.dialogs if d[1] == "Install addon"][0]
         self.assertIn("outside its own folder", message)
-        self.assertIn("unpack it first", message)
+        self.assertIn("7-Zip", message)
 
     def test_replacing_asks_first(self):
         self.open()
@@ -887,6 +887,110 @@ class OrganizerTest(unittest.TestCase):
         self.pump()
         self.wait()
         self.assertTrue(os.path.isfile(os.path.join(self.custom_dir(), "dropped", "materials", "d.vtf")))
+
+
+    # ---------------------------------------------------------------- custom/ files: rename, remove, undo
+
+    def custom_path(self, *parts):
+        return os.path.join(self.game, "hl2", "custom", *parts)
+
+    def test_rename_changes_place_and_undo_puts_it_back(self):
+        write(self.custom_path("aaa", "materials", "a.vtf"), b"a")
+        app = self.open()
+        key = "custom:" + self.custom_path("mymod")
+        app.notes[key] = "keep me"
+        self.assertEqual(self.row(key, "pos"), "C2")
+        app.tree.selection_set(key)
+        self.patch(simpledialog, "askstring", lambda *a, **k: "000mod")
+        app.rename_custom()
+        self.pump()
+        new_key = "custom:" + self.custom_path("000mod")
+        self.assertTrue(os.path.isdir(self.custom_path("000mod")) and not os.path.exists(self.custom_path("mymod")))
+        self.assertEqual(self.row(new_key, "pos"), "C1")  # now first, A to Z
+        self.assertEqual(app.notes.get(new_key), "keep me")
+        app.undo_file_change()
+        self.pump()
+        self.assertTrue(os.path.isdir(self.custom_path("mymod")) and not os.path.exists(self.custom_path("000mod")))
+        self.assertEqual(self.row(key, "pos"), "C2")
+        self.assertEqual(app.notes.get(key), "keep me")
+
+    def test_bad_names_are_refused(self):
+        app = self.open()
+        app.tree.selection_set("custom:" + self.custom_path("mymod"))
+        self.patch(simpledialog, "askstring", lambda *a, **k: "my:mod")
+        app.rename_custom()
+        self.assertTrue(os.path.isdir(self.custom_path("mymod")))
+        self.assertIn("Rename", self.dialog_titles())
+
+    def test_a_split_vpk_moves_with_its_parts(self):
+        # One file, scripts/a.txt, with its data in big_000.vpk.
+        tree = b"txt\0scripts\0a\0" + struct.pack("<IHHIIH", 0, 0, 0, 0, 4, 0xFFFF) + b"\0\0\0"
+        write(self.custom_path("big_dir.vpk"), struct.pack("<III", 0x55AA1234, 1, len(tree)) + tree)
+        write(self.custom_path("big_000.vpk"), b"data")
+        app = self.open()
+        app.toggle_custom(["custom:" + self.custom_path("big_dir.vpk")])
+        off = os.path.join(self.game, "hl2", "custom_disabled")
+        self.assertEqual(sorted(os.listdir(off)), ["big_000.vpk", "big_dir.vpk"])
+        self.assertEqual(sorted(os.listdir(self.custom_path())), ["mymod"])
+
+    def test_remove_goes_to_the_trash(self):
+        trash = os.path.join(self.tmp, "trash")
+        os.makedirs(trash)
+        self.patch(ao, "send_to_trash", lambda p: shutil.move(p, os.path.join(trash, os.path.basename(p))))
+        app = self.open()
+        app.tree.selection_set("custom:" + self.custom_path("mymod"))
+        self.answers = [False]
+        app.remove_custom()
+        self.assertTrue(os.path.isdir(self.custom_path("mymod")))  # said no
+        app.remove_custom()  # yes
+        self.assertFalse(os.path.exists(self.custom_path("mymod")))
+        self.assertEqual(os.listdir(trash), ["mymod"])
+        self.assertNotIn("custom:" + self.custom_path("mymod"), app.tree.get_children())
+
+    @unittest.skipUnless(sys.platform == "win32", "the Recycle Bin is Windows only")
+    def test_send_to_the_recycle_bin(self):
+        path = os.path.join(self.tmp, "recycle me")
+        write(os.path.join(path, "a.txt"), b"a")
+        ao.send_to_trash(path)
+        self.assertFalse(os.path.exists(path))
+
+    def test_old_backups_are_removed(self):
+        folder = os.path.dirname(self.txt)
+        for n in range(12):
+            old = os.path.join(folder, "workshop.txt.2025010%d-%06d.bak" % (n % 9 + 1, n))
+            write(old, b"old")
+            os.utime(old, (1000000 + n, 1000000 + n))
+        write(os.path.join(folder, "workshop.txt.mine.bak"), b"not ours")
+        app = self.open()
+        app.tree.selection_set("555")
+        app.move_selected("top")
+        app.save_order()
+        backups = [n for n in os.listdir(folder) if n.endswith(".bak")]
+        self.assertEqual(len(backups), ao.KEEP_BACKUPS + 1)  # the newest 10 of ours, and the user's own
+        self.assertIn("workshop.txt.mine.bak", backups)
+
+    def fake_7zip(self):
+        """A stand-in for 7-Zip that unpacks zips: enough to test what happens around it."""
+        script = os.path.join(self.tmp, "fake7z.py")
+        write(script, "import sys, zipfile\n"
+                      "args = sys.argv[1:]\n"
+                      "out = [a[2:] for a in args if a.startswith('-o')][0]\n"
+                      "zipfile.ZipFile(args[-1]).extractall(out)\n")
+        self.patch(ao, "find_7zip", lambda: [sys.executable, script])
+
+    def test_install_a_7z(self):
+        self.fake_7zip()
+        self.open()
+        archive = self.zip_file("pack.7z", {"Pack/materials/a.vtf": b"a"})
+        self.install(archive)
+        self.assertTrue(os.path.isfile(os.path.join(self.custom_dir(), "Pack", "materials", "a.vtf")))
+
+    def test_7z_without_7zip(self):
+        self.patch(ao, "find_7zip", lambda: None)
+        self.open()
+        archive = self.zip_file("pack.rar", {"Pack/materials/a.vtf": b"a"})
+        self.install(archive)
+        self.assertIn("install 7-Zip", [d[2] for d in self.dialogs if d[1] == "Install addon"][0])
 
 
 if __name__ == "__main__":

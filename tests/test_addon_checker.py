@@ -86,7 +86,6 @@ def quiet():
 
 def run_main(*argv):
     """Runs addon_checker's main() in this process. Returns (exit code, stdout)."""
-    ac.LOAD_ORDER_NOTE = "Assumes the addon higher in the list wins."
     old = sys.argv
     sys.argv = ["addon_checker.py"] + list(argv)
     try:
@@ -515,6 +514,30 @@ class MixedModels(unittest.TestCase):
         self.assertEqual(self.mixed(a, b), [])
 
 
+class Titles(Base):
+    def test_titles_are_remembered_for_offline_use(self):
+        cache = self.path("titles.json")
+        ac.save_titles({"111": "Cool Map", "222": "HD Pack"}, cache)
+        ac.save_titles({"333": "Другое"}, cache)  # adds, doesn't replace
+        self.assertEqual(ac.cached_titles(["111", "333", "999"], cache), {"111": "Cool Map", "333": "Другое"})
+
+    def test_damaged_cache_is_ignored(self):
+        cache = self.path("titles.json")
+        write(cache, "{not json")
+        self.assertEqual(ac.cached_titles(["111"], cache), {})
+        ac.save_titles({"111": "Cool Map"}, cache)
+        self.assertEqual(ac.cached_titles(["111"], cache), {"111": "Cool Map"})
+
+    def test_offline_run_uses_the_cache(self):
+        old = ac.title_cache_file
+        ac.title_cache_file = lambda: self.path("titles.json")
+        self.addCleanup(setattr, ac, "title_cache_file", old)
+        ac.save_titles({"111": "Cool Map"})
+        lib, game, workshop = self.library(items={"111": {"maps/a.bsp": "a"}}, order=[("111", 1)])
+        code, out = run_main("--offline", "--no-base-game", "--find", "a.bsp", workshop)
+        self.assertIn("Cool Map [workshop 111]", out)
+
+
 class CustomLoadOrder(Base):
     """custom/ addons load ahead of every Workshop addon, A to Z by folder name; the later one wins."""
 
@@ -638,7 +661,7 @@ class CommandLine(Base):
         self.addon("c", "a", {"scripts/a.txt": "a"})
         code, out = run_main("--offline", "--no-base-game", "--out", self.tmp, self.path("c"))
         self.assertEqual(code, 1)
-        self.assertIn("HL2 Addon Checker: 1 addons", out)
+        self.assertIn("HL2 Addon Checker %s: 1 addons" % ac.__version__, out)
 
     def test_conflicts_and_mixed_models_exit_2(self):
         self.addon("c", "mesh", {"models/z/a.mdl": "m", "models/z/a.vvd": "v", "models/z/a.dx90.vtx": "x"})

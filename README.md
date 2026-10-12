@@ -1,24 +1,52 @@
 # HL2 Addon Checker
 
+> ### ⚠️ This project was vibe-coded
+>
+> **This tool was written almost entirely by an AI model** ("vibe-coded"), directed and tested by a
+> person on a real Half-Life 2 install. Nobody has reviewed every line of it the way a careful human
+> author would. Treat it accordingly:
+>
+> - **Back up first.** Copy your `custom/` folders and `hl2_complete/cfg/workshop.txt` somewhere safe
+>   before using the organizer. It moves, renames, installs and removes addon files, and rewrites
+>   `workshop.txt`.
+> - **Don't trust its advice blindly.** "Does nothing, safe to remove" and "which addon wins" come from
+>   the tool's own reading of your files and of how the game loads them. Check in game before you
+>   unsubscribe from or delete anything you care about.
+> - **There is no warranty** of any kind (see [LICENSE](LICENSE)). If it breaks your setup, you get to
+>   keep both pieces.
+> - Bug reports are welcome, but fixes will probably be vibe-coded too.
+
 Finds Half-Life 2 addons that break each other. It scans your Steam Workshop
 addons (`steamapps/workshop/content/220`) and your `custom/` folders, and reports:
 
 | Section | Meaning |
 |---|---|
-| **Addons that do nothing** | Every file is overwritten by an addon that loads ahead of it, or is an exact copy of a file another addon provides. Safe to remove all at once. Some are only safe together with others (marked *only together with*): removing one of those alone changes the game. Addons that couldn't be fully read are never listed here. |
+| **Addons that do nothing** | Every file is overwritten by an addon that loads after it, or is an exact copy of a file another addon provides. Safe to remove all at once. Some are only safe together with others (marked *only together with*): removing one of those alone changes the game. Addons that couldn't be fully read are never listed here. |
 | **Addons with copies of base game files** | Files identical to the game's own. They change nothing, unless they win over another addon's version and so put the original back. Conflicts mark such copies `[same as base game]`. |
 | **Addons that mostly do nothing** | At least half the files are overwritten or duplicated. They still change something. |
 | **Addon pairs with the most conflicts** | Which addons fight the most, and which one wins. |
 | **Conflicts** | Two addons ship the same file with **different** contents. The game only uses one, so the other addon is partly broken. |
 | `[!]` conflicts | The file is in `scripts/`, `resource/`, `cfg/` or `maps/`: weapon scripts, sound scripts, UI and maps. These are the most likely to break gameplay. |
 | `[MODEL]` conflicts | The file is part of a model (`models/`). |
-| **Models built from different addons** | The game takes each part of a model (`.mdl`, `.vvd`, `.dx90.vtx`, `.phy`, `.ani`) from the first addon that has it, so a model can end up made of different addons' parts, even when no single file conflicts (e.g. one addon adds a `.phy` to another addon's model). Mismatched parts give invisible or distorted models, or crashes. Parts from the original game aren't counted, since a reskin can legitimately ship only a hex-edited `.mdl`. |
+| **Models built from different addons** | The game takes each part of a model (`.mdl`, `.vvd`, `.dx90.vtx`, `.phy`, `.ani`) from the last addon to load that has it, so a model can end up made of different addons' parts, even when no single file conflicts (e.g. one addon adds a `.phy` to another addon's model). Mismatched parts give invisible or distorted models, or crashes. Parts from the original game aren't counted, since a reskin can legitimately ship only a hex-edited `.mdl`. |
 | **Same-path duplicates** | Same file, identical contents, in several addons. Harmless. |
 | **Content duplicates** | Identical file contents under different names in different addons. Harmless, just wasted space. |
 
+## Download
+
+Get the zip from the [Releases page](../../releases): it has `addon_organizer.exe` (the window) and
+`addon_checker.exe` (the report) for Windows, plus the `.py` files. Unpack it anywhere and run one.
+Windows SmartScreen may warn that the program is unrecognized: it isn't signed. If you'd rather not
+run an unsigned `.exe` (reasonable, given the warning above), run the `.py` files with Python instead.
+
+> ⚠️ **Vibe-coded software, no warranty.** Back up your addons and `workshop.txt` first.
+
+Public domain: see [LICENSE](LICENSE) (The Unlicense). What changed in each version is in
+[CHANGELOG.md](CHANGELOG.md).
+
 ## Running it
 
-You need [Python 3.7+](https://www.python.org/downloads/). No extra packages.
+You need [Python 3.7+](https://www.python.org/downloads/) (or the `.exe` from the release). No extra packages.
 
 ```sh
 python addon_checker.py
@@ -57,6 +85,10 @@ something went wrong (a folder or `--load-order` file that can't be opened, a re
 
 ## Organizer window
 
+> ⚠️ **The organizer changes files on disk.** It was vibe-coded (written by an AI). Saving rewrites
+> `workshop.txt`, and the `custom/` features below move, rename, install and remove addon folders
+> right away. Keep your own backup.
+
 ```sh
 python addon_organizer.py
 ```
@@ -91,14 +123,14 @@ folder; tkinter comes with the python.org installer on Windows. Dark and light t
   companion files (`maps/graphs/*.ain` node graphs, `_l_0.lmp` lighting patches, map materials),
   a common cause of map bugs when they come from a different addon than the `.bsp`.
 - **Rules tab:** all rules, and which are broken. **Sort by rules** fixes broken ones by moving each
-  winner just ahead of its loser, leaving everything else where it was.
+  winner just after its loser (the later one wins), leaving everything else where it was.
 - **Notes:** a note per addon, shown in the Notes column and searchable with the filter.
 
 **`custom/` addons**
 
 - They're shown first, as **C1, C2…**, in the order the game loads them: ahead of the Workshop addons,
   A to Z by folder name. Every Workshop addon loads later, so it wins over them; among themselves, Z
-  beats A. Rename the folder to change its place.
+  beats A. **Rename...** (right-click) changes its name, and so its place.
 - **The checkbox** turns one off by moving it to `custom_disabled/`, next to its `custom/` folder (the
   game loads everything inside `custom/`, so it can't stay there), and back on again. This happens right
   away, without Save. A name that's already taken on the other side is never overwritten.
@@ -108,13 +140,23 @@ folder; tkinter comes with the python.org installer on Windows. Dark and light t
   - a folder (an extra wrapper folder, like `HD Crowbar/HD Crowbar/materials`, is skipped),
   - a `.vpk` (a `foo_dir.vpk` comes with its `foo_000.vpk`… parts),
   - a `.zip`, which is unpacked; one with only VPKs puts them straight into `custom/`.
-  `.7z` and `.rar` need unpacking first. An addon that's already there is only replaced after you say so,
-  and the organizer rescans afterwards.
+  - a `.7z` or `.rar`, if [7-Zip](https://7-zip.org) is installed (it does the unpacking).
+
+  An addon that's already there is only replaced after you say so, and the organizer rescans afterwards.
+- **Remove (to the Recycle Bin)...** (right-click) moves a `custom/` addon to the Recycle Bin (or the
+  Trash on Linux), where you can restore it from. It never deletes for good: if that isn't possible,
+  nothing happens.
+- **Edit > Undo addon file change** puts back the last turn on/off or rename (they happen on disk right
+  away, so the load order's own Undo doesn't cover them).
+
+> ⚠️ Vibe-coded: these move real folders around. Close the game first, and keep a backup of anything
+> you can't download again.
 
 **Toolbar and menus**
 
 - **Save load order** (Ctrl+S) writes `workshop.txt` after backing up the old one as
-  `workshop.txt.<date>-<time>.bak`. **Close the game first**, since it may rewrite the file.
+  `workshop.txt.<date>-<time>.bak` (the newest 10 backups are kept). **Close the game first**, since it
+  may rewrite the file. If the game changed `workshop.txt` since it was read, you're asked first.
 - **Undo / Redo** (Ctrl+Z / Ctrl+Y) every load order change; File > Revert to saved.
 - **Group idle addons** moves every addon that does nothing to the losing end of the list. The game
   plays the same, and they end up together in the game's Add-ons screen for unsubscribing.
@@ -126,7 +168,8 @@ folder; tkinter comes with the python.org installer on Windows. Dark and light t
   A Steam library folder (e.g. `D:\SteamLibrary`) is fine too. It opens by itself if Steam can't be found.
 - File > **Export report...** writes the same report as `addon_checker.py` for the current order.
 
-Rules, notes, profiles, theme and window layout are kept in `addon_rules.json` next to the tool.
+Rules, notes, profiles, theme and window layout are kept in `addon_rules.json` next to the tool, and
+Workshop titles in `addon_titles.json` (so they show offline too).
 
 ## What it reads
 
@@ -169,6 +212,9 @@ The game keeps your Workshop addons' load order in
   addons Z beats A. Addons in `custom_disabled/` (the organizer's "off") aren't loaded or checked.
 
 ## Tests
+
+> ⚠️ Passing tests don't make vibe-coded software safe: the tests were written by the same AI, from the
+> same understanding of how the game works.
 
 ```sh
 python -m unittest tests.test_addon_checker -v
@@ -277,3 +323,10 @@ tests/
   run_tests.py                  tests for the command-line build
   check_sdk_build.sh            compiles the game-side code against SDK headers
 ```
+
+## Once more: this was vibe-coded
+
+Almost all of this repository (the Python tools, the organizer, the C++ version, the tests and this
+README) was written by an AI model, with a person directing it and testing each version on a real
+Half-Life 2 install. It's public domain and comes with no warranty. Back up your addons and
+`workshop.txt`, and double-check anything it tells you to remove.

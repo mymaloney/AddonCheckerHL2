@@ -34,7 +34,8 @@ from tkinter import font as tkfont
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import addon_checker as ac  # noqa: E402
 
-SETTINGS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "addon_rules.json")
+SETTINGS_FILE = os.path.join(ac.app_dir(), "addon_rules.json")  # next to the .py or the .exe
+KEEP_BACKUPS = 10  # workshop.txt backups kept; older ones are removed when saving
 WORKSHOP_URL = "https://steamcommunity.com/sharedfiles/filedetails/?id=%s"
 
 THEMES = {
@@ -251,6 +252,141 @@ def vpk_parts(path):
     return parts
 
 
+def find_7zip():
+    """The command to run 7-Zip, which unpacks .7z and .rar (Python can't), or None."""
+    for name in ("7z", "7za", "7zz"):
+        exe = shutil.which(name)
+        if exe:
+            return [exe]
+    for var in ("ProgramFiles", "ProgramW6432", "ProgramFiles(x86)"):
+        exe = os.path.join(os.environ.get(var, ""), "7-Zip", "7z.exe")
+        if os.environ.get(var) and os.path.isfile(exe):
+            return [exe]
+    return None
+
+
+def unpack_7zip(source, target):
+    name = os.path.basename(source)
+    command = find_7zip()
+    if not command:
+        raise InstallError("%s: install 7-Zip (7-zip.org) to install .7z and .rar files here, or unpack it "
+                           "yourself and drop the folder" % name)
+    os.makedirs(target)
+    flags = 0x08000000 if sys.platform == "win32" else 0  # CREATE_NO_WINDOW: no console flashing up
+    try:
+        done = subprocess.run(command + ["x", "-y", "-o" + target, source], stdout=subprocess.PIPE,
+                              stderr=subprocess.STDOUT, creationflags=flags, timeout=600)
+    except (OSError, subprocess.SubprocessError) as e:
+        raise InstallError("can't unpack %s: %s" % (name, e))
+    if done.returncode:
+        output = done.stdout.decode("utf-8", "replace").strip().splitlines()
+        raise InstallError("can't unpack %s: %s" % (name, output[-1] if output else "7-Zip failed"))
+    # 7-Zip keeps paths inside the folder, but check anyway, and refuse links: they could point anywhere.
+    real = os.path.realpath(target)
+    for dirpath, dirs, names in os.walk(target):
+        for n in dirs + names:
+            p = os.path.join(dirpath, n)
+            if os.path.islink(p) or not os.path.realpath(p).startswith(real + os.sep):
+                raise InstallError("%s has a file outside its own folder (%s); not installed" % (name, n))
+
+
+def unpacked_addon(target, name):
+    """What to install from an unpacked archive: [(name in custom/, path)]."""
+    root = addon_root(target)
+    entries = os.listdir(root)
+    vpks = [n for n in entries if n.lower().endswith(".vpk")]
+    if vpks and len(vpks) == len(entries) and not any(n.lower().startswith("pak01_") for n in vpks):
+        return [(n, os.path.join(root, n)) for n in sorted(vpks)]  # loose VPKs go in custom/ itself
+    top = os.path.basename(root) if root != target else os.path.splitext(name)[0]
+    return [(top, root)]
+
+
+def addon_files(location):
+    """The files on disk that make up a custom/ addon: its folder or VPK, and a foo_dir.vpk's parts."""
+    if os.path.isfile(location) and re.search(r"_dir\.vpk$", location, re.IGNORECASE):
+        return vpk_parts(location)
+    return [location]
+
+
+def moves_for(location, dest):
+    """[(from, to)] to move or rename an addon from location to dest; a foo_dir.vpk's parts follow it."""
+    files = addon_files(location)
+    if len(files) == 1:
+        return [(location, dest)]
+    stem = re.match(r"(.*)_dir\.vpk$", os.path.basename(location), re.IGNORECASE).group(1)
+    m = re.match(r"(.*)_dir\.vpk$", os.path.basename(dest), re.IGNORECASE)
+    new_stem = m.group(1) if m else os.path.splitext(os.path.basename(dest))[0]
+    return [(f, os.path.join(os.path.dirname(dest), new_stem + os.path.basename(f)[len(stem):])) for f in files]
+
+
+def move_files(moves):
+    """Moves every (from, to) or none: never overwrites, and puts back what moved if one fails."""
+    for _, dest in moves:
+        if os.path.lexists(dest):
+            raise OSError("%s is already there" % os.path.basename(dest))
+    done = []
+    try:
+        for src, dest in moves:
+            os.makedirs(os.path.dirname(dest), exist_ok=True)
+            os.replace(src, dest)
+            done.append((src, dest))
+    except OSError:
+        for src, dest in reversed(done):
+            try:
+                os.replace(dest, src)
+            except OSError:
+                pass
+        raise
+
+
+def send_to_trash(path):
+    """To the Recycle Bin (Windows) or the desktop's Trash, so it can be restored. Raises OSError
+    if that isn't possible; never deletes for good."""
+    path = os.path.abspath(path)
+    if sys.platform == "win32":
+        import ctypes
+        from ctypes import wintypes
+        fields = [("hwnd", wintypes.HWND), ("wFunc", wintypes.UINT), ("pFrom", wintypes.LPCWSTR),
+                  ("pTo", wintypes.LPCWSTR), ("fFlags", ctypes.c_ushort), ("fAnyOperationsAborted", wintypes.BOOL),
+                  ("hNameMappings", ctypes.c_void_p), ("lpszProgressTitle", wintypes.LPCWSTR)]
+        attrs = {"_fields_": fields}
+        if ctypes.sizeof(ctypes.c_void_p) == 4:
+            attrs = {"_pack_": 1, "_fields_": fields}  # 32-bit shellapi.h packs this structure
+        op_type = type("SHFILEOPSTRUCTW", (ctypes.Structure,), attrs)
+        # FO_DELETE with ALLOWUNDO (Recycle Bin), NOCONFIRMATION, SILENT, NOERRORUI, WANTNUKEWARNING
+        # (asks instead of deleting for good where there's no Recycle Bin, e.g. a network drive).
+        op = op_type(None, 3, path + "\0", None, 0x0040 | 0x0010 | 0x0004 | 0x0400 | 0x4000, False, None, None)
+        result = ctypes.windll.shell32.SHFileOperationW(ctypes.byref(op))
+        if result or op.fAnyOperationsAborted or os.path.lexists(path):
+            raise OSError("couldn't move %s to the Recycle Bin (error %d)" % (os.path.basename(path), result))
+        return
+    for command in (["gio", "trash"], ["trash-put"], ["kioclient5", "move"]):
+        exe = shutil.which(command[0])
+        if not exe:
+            continue
+        args = [exe] + command[1:] + [path] + (["trash:/"] if command[0] == "kioclient5" else [])
+        if subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE).returncode == 0 \
+                and not os.path.lexists(path):
+            return
+    raise OSError("couldn't move %s to the Trash: no Trash found on this system" % os.path.basename(path))
+
+
+def prune_backups(path, keep=KEEP_BACKUPS):
+    """Removes all but the newest `keep` workshop.txt.<date>-<time>.bak backups made by the organizer."""
+    folder, name = os.path.split(path)
+    try:
+        found = [os.path.join(folder, n) for n in os.listdir(folder)
+                 if n.startswith(name + ".") and n.endswith(".bak") and re.match(r"\.\d{8}-\d{6}", n[len(name):])]
+        found.sort(key=lambda p: (os.path.getmtime(p), p))
+    except OSError:
+        return
+    for old in found[:-keep] if keep else found:
+        try:
+            os.remove(old)
+        except OSError:
+            pass
+
+
 def plan_install(source, workdir):
     """What dropping source installs: [(name in custom/, path to copy)]. A .zip is unpacked into workdir.
     Raises InstallError for things that aren't addons."""
@@ -272,16 +408,12 @@ def plan_install(source, workdir):
                 z.extractall(target)
         except (zipfile.BadZipFile, RuntimeError, NotImplementedError, OSError) as e:
             raise InstallError("can't unpack %s: %s" % (name, e))
-        root = addon_root(target)
-        entries = os.listdir(root)
-        vpks = [n for n in entries if n.lower().endswith(".vpk")]
-        if vpks and len(vpks) == len(entries) and not any(n.lower().startswith("pak01_") for n in vpks):
-            return [(n, os.path.join(root, n)) for n in sorted(vpks)]  # loose VPKs go in custom/ itself
-        top = os.path.basename(root) if root != target else os.path.splitext(name)[0]
-        return [(top, root)]
+        return unpacked_addon(target, name)
     if lower.endswith((".7z", ".rar")):
-        raise InstallError("%s: unpack it first (7-Zip or WinRAR), then drop the folder" % name)
-    raise InstallError("%s isn't an addon: drop a folder, a .vpk or a .zip" % name)
+        target = os.path.join(workdir, "unpacked")
+        unpack_7zip(source, target)
+        return unpacked_addon(target, name)
+    raise InstallError("%s isn't an addon: drop a folder, a .vpk, a .zip, a .7z or a .rar" % name)
 
 
 def copy_into(src, dest):
@@ -388,7 +520,7 @@ class Tooltip:
 class Organizer:
     def __init__(self, root):
         self.root = root
-        root.title("HL2 Addon Organizer")
+        root.title("HL2 Addon Organizer %s" % ac.__version__)
         root.minsize(1000, 560)
 
         self.addons = []          # every installed addon with content
@@ -407,6 +539,7 @@ class Organizer:
         self.base_addon = ac.Addon(name="Half-Life 2 (original game files)", location="(base game)")
         self.leftovers = []
         self.custom_dirs = []     # the custom/ folders the game loads, in its order
+        self.file_undo = []       # [(addon, old location, old custom_off)]: moves and renames on disk
         self.strays = []          # in the Workshop folder but not item folders: never loaded
         self.empty_folders = []   # custom/ folders with no addon files
         self.together = {}        # removable addon -> the others it may only be removed with
@@ -683,6 +816,7 @@ class Organizer:
         e = menu("Edit")
         e.add_command(label="Undo", accelerator="Ctrl+Z", command=self.undo)
         e.add_command(label="Redo", accelerator="Ctrl+Y", command=self.redo)
+        e.add_command(label="Undo addon file change (custom/ on, off, rename)", command=self.undo_file_change)
         e.add_separator()
         e.add_command(label="Turn selected on / off", accelerator="Space", command=self.toggle_enabled)
         e.add_command(label="Move to top", accelerator="Ctrl+Home", command=lambda: self.move_selected("top"))
@@ -753,7 +887,7 @@ class Organizer:
         theme = self.theme_name.get
         Tooltip(self.save_btn, "Write the load order to the game's workshop.txt (the game's version is backed up "
                                "first). Close the game before saving.", theme)
-        Tooltip(sort_btn, "Reorder so every rule is met, moving each rule's winner just ahead of its loser.", theme)
+        Tooltip(sort_btn, "Reorder so every rule is met, moving each rule's winner just after its loser (the later one wins).", theme)
         Tooltip(clean_btn, "Move every addon that does nothing to the end of the list where it loses. "
                            "The game plays the same, and they end up together for unsubscribing.", theme)
         Tooltip(install, "Copy an addon (.vpk, .zip or a folder) into the game's custom folder. On Windows you can "
@@ -1170,8 +1304,9 @@ class Organizer:
         self.saved_order = [list(e) for e in self.order]
         self.disk_entries, self.disk_ours = [(w, bool(e)) for w, e in entries], False
         self.history, self.future = [], []
+        self.file_undo = []  # these addons are new objects
         self.selected = None
-        self.root.title("HL2 Addon Organizer - %s" % (game or workshop or "no folders"))
+        self.root.title("HL2 Addon Organizer %s - %s" % (ac.__version__, game or workshop or "no folders"))
         self.recompute()
         if repeated:
             names = [self.by_id[w].name if w in self.by_id else "Workshop item %s" % w for w in repeated]
@@ -1552,6 +1687,21 @@ class Organizer:
             return dirs.index(folder) if folder in dirs else len(dirs), ac.name_order(os.path.basename(a.location))
         return sorted((a for a in self.addons if not a.workshop_id and not a.custom_off), key=key)
 
+    def move_addon(self, a, dest, off, undo=True):
+        """Moves or renames a custom/ addon on disk (a foo_dir.vpk with its parts) and updates it
+        here, keeping its note. Raises OSError; nothing is overwritten or left half moved."""
+        old_location, old_off, old_key = a.location, a.custom_off, self.addon_key(a)
+        move_files(moves_for(a.location, dest))
+        folder = os.path.dirname(dest)
+        a.location, a.custom_off = dest, off
+        a.name = "%s/%s/%s" % (os.path.basename(os.path.dirname(folder)), os.path.basename(folder),
+                               os.path.basename(dest))
+        if old_key in self.notes:
+            self.notes[self.addon_key(a)] = self.notes.pop(old_key)
+        if undo:
+            self.file_undo.append((a, old_location, old_off))
+            del self.file_undo[:-50]
+
     def toggle_custom(self, keys):
         """Turns custom/ addons on or off by moving them between custom/ and custom_disabled/
         right away (the game reads folders, not a list). Like the Workshop checkboxes: if any
@@ -1565,36 +1715,107 @@ class Organizer:
             if a.custom_off != turn_on:
                 continue  # already that way
             folder, name = os.path.split(os.path.abspath(a.location))
-            if turn_on:
-                dest_dir = os.path.join(os.path.dirname(folder), "custom")
-            else:
-                dest_dir = disabled_dir(folder)
-            dest = os.path.join(dest_dir, name)
-            if os.path.lexists(dest):
-                problems.append("%s: %s already has one with that name" % (name, dest_dir))
-                continue
+            dest_dir = os.path.join(os.path.dirname(folder), "custom") if turn_on else disabled_dir(folder)
             try:
-                os.makedirs(dest_dir, exist_ok=True)
-                os.replace(a.location, dest)
+                self.move_addon(a, os.path.join(dest_dir, name), not turn_on)
             except OSError as e:
-                problems.append("%s: %s (close the game if it's running)" % (name, e.strerror or e))
+                problems.append("%s: %s (if the game is running, close it)" % (name, e.strerror or e))
                 continue
-            old_key = self.addon_key(a)
-            a.location, a.custom_off = dest, not turn_on
-            a.name = "%s/%s/%s" % (os.path.basename(os.path.dirname(dest_dir)), os.path.basename(dest_dir), name)
-            if old_key in self.notes:
-                self.notes[self.addon_key(a)] = self.notes.pop(old_key)
             moved.append(name)
-        if moved:
-            self.save_settings()
+        self.after_file_change(addons, moved, "Turned on" if turn_on else "Turned off",
+                               "moved to " + ("custom" if turn_on else DISABLED_FOLDER), problems)
+
+    def after_file_change(self, addons, done, verb, how, problems):
+        if done:
+            self.save_settings()  # notes follow the files
             self.recompute()
-            self.tree.selection_set([self.addon_key(a) for a in addons if self.tree.exists(self.addon_key(a))])
-            self.status.config(text="%s %s (moved to %s)." % ("Turned on" if turn_on else "Turned off",
-                                                             ", ".join(moved[:3]) + (" and more" if len(moved) > 3
-                                                                                     else ""),
-                                                             "custom" if turn_on else DISABLED_FOLDER))
+            keys = [self.addon_key(a) for a in addons if self.tree.exists(self.addon_key(a))]
+            if keys:
+                self.tree.selection_set(keys)
+            self.status.config(text="%s %s (%s). Edit > Undo addon file change puts it back." % (
+                verb, ", ".join(done[:3]) + (" and more" if len(done) > 3 else ""), how))
         if problems:
             messagebox.showwarning("custom/ addons", "\n".join(problems[:8]))
+
+    def selected_custom(self):
+        return [a for a in (self.addon_for_key(k) for k in self.tree.selection()) if a and not a.workshop_id]
+
+    def rename_custom(self):
+        """Renaming is how a custom/ addon changes place: the game loads them A to Z."""
+        addons = self.selected_custom()
+        if len(addons) != 1:
+            return
+        a = addons[0]
+        folder, name = os.path.split(a.location)
+        is_vpk = os.path.isfile(a.location)
+        new = simpledialog.askstring(
+            "Rename", "New name for %s.\ncustom/ addons load A to Z, and a later one wins over an earlier one."
+            % name, initialvalue=name, parent=self.root)
+        if new is None:
+            return
+        new = new.strip().rstrip(". ")
+        if is_vpk and not new.lower().endswith(".vpk"):
+            new += ".vpk"
+        if is_vpk and len(addon_files(a.location)) > 1 and not new.lower().endswith("_dir.vpk"):
+            new = new[:-4] + "_dir.vpk"  # foo_dir.vpk needs the _dir to find its parts
+        if not new or new == name:
+            return
+        if re.search(r'[\\/:*?"<>|]', new) or new.lower() in ("custom", DISABLED_FOLDER):
+            messagebox.showerror("Rename", "%s can't be used as a name." % new)
+            return
+        try:
+            self.move_addon(a, os.path.join(folder, new), a.custom_off)
+        except OSError as e:
+            messagebox.showerror("Rename", "%s: %s (if the game is running, close it)" % (name, e.strerror or e))
+            return
+        self.after_file_change([a], [new], "Renamed %s to" % name, "custom/ addons load A to Z", [])
+
+    def remove_custom(self):
+        """custom/ addons to the Recycle Bin (or Trash), where they can be restored from."""
+        addons = self.selected_custom()
+        if not addons:
+            return
+        names = [os.path.basename(a.location) for a in addons]
+        if not messagebox.askyesno(
+                "Remove", "Move %s to the Recycle Bin?\n\n%s\n\nYou can restore it from there."
+                % (ac.plural(len(addons), "custom/ addon"), "\n".join(names[:8]) + ("\n..." if len(names) > 8 else ""))):
+            return
+        removed, problems = [], []
+        for a in addons:
+            try:
+                for path in addon_files(a.location):
+                    send_to_trash(path)
+            except (OSError, InstallError) as e:
+                problems.append("%s: %s" % (os.path.basename(a.location), e.strerror if isinstance(e, OSError)
+                                            and e.strerror else e))
+                continue
+            removed.append(os.path.basename(a.location))
+            self.addons.remove(a)
+            self.notes.pop(self.addon_key(a), None)
+            self.file_undo = [u for u in self.file_undo if u[0] is not a]
+        if removed:
+            self.save_settings()
+            self.recompute()
+            self.status.config(text="Moved %s to the Recycle Bin." % ", ".join(removed[:3]) + (
+                " and more" if len(removed) > 3 else ""))
+        if problems:
+            messagebox.showwarning("Remove", "\n".join(problems[:8]))
+
+    def undo_file_change(self):
+        """Undoes the last move or rename of a custom/ addon (turning on or off, Rename)."""
+        while self.file_undo:
+            a, location, off = self.file_undo.pop()
+            if a not in self.addons:
+                continue
+            try:
+                self.move_addon(a, location, off, undo=False)
+            except OSError as e:
+                messagebox.showerror("Undo", "%s: %s" % (os.path.basename(a.location), e.strerror or e))
+                return
+            self.after_file_change([a], [os.path.basename(location)], "Put back", "undone", [])
+            self.status.config(text="Put back %s." % os.path.basename(location))
+            return
+        self.status.config(text="No addon file change to undo.")
 
     def column_at(self, x):
         col = self.tree.identify_column(x)
@@ -1681,7 +1902,7 @@ class Organizer:
     def sort_by_rules(self):
         """
         Satisfies every rule with as little movement as possible: each rule's
-        winner moves to just ahead of its loser, everything else keeps its order.
+        winner moves to just after its loser (the later one wins), everything else keeps its order.
         """
         ids = self.listed_ids()
         last_wins = self.last_wins.get()
@@ -1772,6 +1993,14 @@ class Organizer:
                       command=self.open_selected_folder)
         m.add_command(label="Copy Workshop ID", state="normal" if single and a.workshop_id else "disabled",
                       command=self.copy_workshop_id)
+        custom = self.selected_custom()
+        if custom:
+            m.add_separator()
+            m.add_command(label="Turn on" if any(x.custom_off for x in custom) else "Turn off",
+                          command=lambda: self.toggle_custom([self.addon_key(x) for x in custom]))
+            m.add_command(label="Rename... (changes its place)", state="normal" if len(custom) == 1 else "disabled",
+                          command=self.rename_custom)
+            m.add_command(label="Remove (to the Recycle Bin)...", command=self.remove_custom)
         try:
             m.tk_popup(event.x_root, event.y_root)
         finally:
@@ -2127,6 +2356,7 @@ class Organizer:
             if os.path.exists(path) and (changed or not self.disk_ours):
                 backup = unique_path(path + time.strftime(".%Y%m%d-%H%M%S"), ".bak")
                 shutil.copy2(path, backup)
+                prune_backups(path)
             ac.write_load_order(path, entries)
         except OSError as e:
             messagebox.showerror("Couldn't save", str(e))
@@ -2553,7 +2783,7 @@ class Organizer:
             self.start_scan()
 
     def show_help(self):
-        messagebox.showinfo("How it works", (
+        messagebox.showinfo("How it works - version %s" % ac.__version__, (
             "The list is the load order: your custom/ addons first (A to Z), then the Workshop addons in "
             "workshop.txt's order. The addon lower in the list loads later and wins when two addons have "
             "the same file.\n\n"
@@ -2565,11 +2795,18 @@ class Organizer:
             "movement as possible.\n\n"
             "custom/ addons (shown first, C1, C2...) load ahead of every Workshop addon, A to Z by folder name. "
             "Install one with Install addon..., or on Windows by dropping it on the window.\n\n"
-            "Changes only reach the game when you Save. Close the game first. Before the organizer replaces a "
-            "workshop.txt it didn't write itself, it keeps a backup of it."))
+            "Load order changes only reach the game when you Save. Close the game first. Before the organizer "
+            "replaces a workshop.txt it didn't write itself, it keeps a backup of it (the newest %d are kept).\n\n"
+            "Turning custom/ addons on or off, renaming and removing them happen right away, on disk. "
+            "Edit > Undo addon file change puts a move or rename back; removed addons are in the Recycle Bin.\n\n"
+            "This tool was largely written by an AI (\"vibe-coded\") and comes with no warranty. Keep your own "
+            "backup of your addons and workshop.txt." % KEEP_BACKUPS))
 
 
 def main():
+    # The windowed .exe has no console: printing (the checker reports some things that way) would fail.
+    if sys.stdout is None or sys.stderr is None:
+        sys.stdout = sys.stderr = open(os.devnull, "w")
     if sys.platform == "win32":
         try:
             from ctypes import windll

@@ -11,6 +11,9 @@ ship duplicate copies of the same file. Scans Steam Workshop items
     python addon_checker.py --help           all options
 
 No third-party packages needed; Python 3.7 or newer.
+
+Public domain (The Unlicense). Largely written by an AI model ("vibe-coded"):
+see the warnings in README.md.
 """
 
 import argparse
@@ -33,6 +36,8 @@ import zipfile
 import zlib
 from collections import defaultdict
 from dataclasses import dataclass, field
+
+__version__ = "1.0.0"
 
 HL2_APPID = "220"
 VPK_MAGIC = struct.pack("<I", 0x55AA1234)
@@ -566,14 +571,64 @@ def scan(containers, progress=print_progress, workshop_dirs=(), slow=print_slow,
 # Workshop titles
 # ---------------------------------------------------------------------------
 
-def fetch_workshop_titles(ids, deadline=20):
-    """Looks up item titles with Steam's public API. Gives up after `deadline` seconds,
-    returning whatever it has (nothing if offline)."""
+def app_dir():
+    """The tool's own folder, for its settings and caches. In a PyInstaller .exe, __file__ is in a
+    temporary folder that's deleted on exit, so it's the .exe's folder instead."""
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(os.path.abspath(sys.executable))
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def title_cache_file():
+    return os.path.join(app_dir(), "addon_titles.json")
+
+
+def cached_titles(ids, path=None):
+    """Titles from earlier lookups, so they show without a connection too."""
+    try:
+        with open(path or title_cache_file(), encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return {i: data[i] for i in ids if isinstance(data.get(i), str)}
+
+
+def save_titles(titles, path=None):
+    path = path or title_cache_file()
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            data = {}
+    except (OSError, ValueError):
+        data = {}
+    data.update(titles)
+    tmp = path + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=1, sort_keys=True, ensure_ascii=False)
+        os.replace(tmp, path)
+    except OSError:
+        pass  # only a cache
+
+
+def fetch_workshop_titles(ids, deadline=20, cache=True):
+    """Looks up item titles with Steam's public API. Gives up after `deadline` seconds. Titles
+    found are remembered (cache=True), and earlier ones fill in what Steam doesn't answer."""
     titles = {}
     worker = threading.Thread(target=_fetch_titles, args=(sorted(ids), titles), daemon=True)
     worker.start()
     worker.join(deadline)
-    return dict(titles)
+    titles = dict(titles)
+    if not cache:
+        return titles
+    if titles:
+        save_titles(titles)
+    known = cached_titles(ids)
+    known.update(titles)
+    return known
 
 
 def _fetch_titles(ids, titles):
@@ -949,7 +1004,7 @@ def severity(path):
 def find_idle_addons(addons, by_path, base=None):
     """
     Works out what each addon actually contributes. A file does nothing when
-    an addon that loads ahead of it overwrites it, when another addon has an
+    an addon that loads after it overwrites it, when another addon has an
     identical copy that would take over, or when it's identical to the base
     game's own file and no other addon has it. Addons where every file does
     nothing can be removed without changing the game.
@@ -1063,7 +1118,7 @@ def model_part(path):
 def find_mixed_models(by_path):
     """
     Models the game builds from parts of different addons. It takes each part (.mdl, .vvd,
-    .dx90.vtx, .phy, .ani) from the first addon that has it, and the parts have to match:
+    .dx90.vtx, .phy, .ani) from the last addon to load that has it, and the parts have to match:
     a .vvd or .vtx from another build of the model makes it invisible, distorted or crash.
 
     A model is mixed when no single addon has every part the game ends up using (identical
@@ -1283,7 +1338,7 @@ def format_report(addons, skipped, containers, load_order, analysis, limit, base
     w = out.append
 
     total_files = sum(len(a.files) for a in addons)
-    w("HL2 Addon Checker: %d addons, %d files" % (len(addons), total_files))
+    w("HL2 Addon Checker %s: %d addons, %d files" % (__version__, len(addons), total_files))
     w("%d conflicts, %d mixed models, %d same-path duplicates, %d content duplicates"
       % (len(conflicts), len(mixed_models), len(same_path), len(content_dupes)))
     w("%d addons do nothing and can be removed" % len(removed))
@@ -1359,7 +1414,7 @@ def format_report(addons, skipped, containers, load_order, analysis, limit, base
     mostly = sorted((e for e in idle if e[0] not in removed),
                     key=lambda e: -idle_count(e) / len(e[0].files))
     idle_entries(nothing, "ADDONS THAT DO NOTHING", [
-        "Every file in these is overwritten by an addon that loads ahead of it, is an",
+        "Every file in these is overwritten by an addon that loads after it, is an",
         "exact copy of a file another addon provides, or is identical to the base game's",
         "own file. Removing all of them changes nothing in game. An addon marked",
         "\"only together with\" must be removed along with those, or the game changes."])
@@ -1404,9 +1459,9 @@ def format_report(addons, skipped, containers, load_order, analysis, limit, base
 
     w("== MODELS BUILT FROM DIFFERENT ADDONS (%d) ==" % len(mixed_models))
     w("The game takes each part of a model (.mdl .vvd .dx90.vtx .phy .ani) from the")
-    w("first addon that has it, so these models end up made of different addons'")
+    w("last addon to load that has it, so these models end up made of different addons'")
     w("parts. Parts that don't match make a model invisible or distorted, or crash")
-    w("the game. Keep one addon's full set of parts, or put it ahead of the others.")
+    w("the game. Keep one addon's full set of parts, or have it load after the others.")
     w("")
     for i, (model, order_known, parts) in enumerate(mixed_models):
         if more(i, mixed_models):
@@ -1538,6 +1593,7 @@ def main():
                     help="list the files matching TEXT (e.g. d1_town_02 or maps/d1_town_*) and which addons change them")
     ap.add_argument("--all", action="store_true",
                     help="also check disabled addons and ones missing from workshop.txt")
+    ap.add_argument("--version", action="version", version="HL2 Addon Checker " + __version__)
     args = ap.parse_args()
     use_safe_output()
 
@@ -1576,11 +1632,14 @@ def main():
         return 1
 
     ids = {a.workshop_id for a in addons if a.workshop_id}
-    if ids and not args.offline:
-        print("Looking up Workshop titles on Steam...", file=sys.stderr, flush=True)
-        titles = fetch_workshop_titles(ids)
-        if not titles:
-            print("  no answer from Steam, showing Workshop ids instead", file=sys.stderr)
+    if ids:
+        if args.offline:
+            titles = cached_titles(ids)  # from earlier runs
+        else:
+            print("Looking up Workshop titles on Steam...", file=sys.stderr, flush=True)
+            titles = fetch_workshop_titles(ids)
+            if not titles:
+                print("  no answer from Steam, showing Workshop ids instead", file=sys.stderr)
         for a in addons:
             if a.workshop_id in titles:
                 a.name = "%s [workshop %s]" % (titles[a.workshop_id], a.workshop_id)
