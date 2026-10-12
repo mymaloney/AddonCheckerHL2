@@ -1,4 +1,4 @@
-# HL2 Addon Checker
+# HL2 Addon Organizer
 
 > ### ⚠️ This project was vibe-coded
 >
