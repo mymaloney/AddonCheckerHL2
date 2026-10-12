@@ -357,6 +357,80 @@ def fetch_workshop_titles(ids):
 
 
 # ---------------------------------------------------------------------------
+# Base game files
+# ---------------------------------------------------------------------------
+
+# Used when gameinfo.txt can't be read: earlier folders win, like the game's own search path.
+FALLBACK_GAME_FOLDERS = ["hl2_complete", "ep2", "episodic", "hl2", "lostcoast", "platform"]
+
+
+def gameinfo_vpks(game_dir):
+    """The VPKs the game mounts, highest priority first, read from gameinfo.txt's SearchPaths.
+    Returns (list of _dir.vpk / .vpk paths, gameinfo.txt path or None)."""
+    for folder in ("hl2_complete", "hl2"):
+        gameinfo = os.path.join(game_dir, folder, "gameinfo.txt")
+        try:
+            with open(gameinfo, encoding="utf-8", errors="replace") as f:
+                text = f.read()
+        except OSError:
+            continue
+        m = re.search(r'"?SearchPaths"?\s*\{(.*?)\}', text, re.IGNORECASE | re.DOTALL)
+        if not m:
+            continue
+        vpks = []
+        for line in m.group(1).splitlines():
+            line = line.split("//")[0]
+            parts = re.findall(r'"([^"]*)"|(\S+)', line)
+            parts = [a or b for a, b in parts]
+            if len(parts) < 2 or not parts[1].lower().endswith(".vpk") or "*" in parts[1]:
+                continue
+            value = parts[1].replace("|gameinfo_path|", os.path.dirname(gameinfo) + "/")
+            value = value.replace("|all_source_engine_paths|", game_dir + "/")
+            path = os.path.normpath(value if os.path.isabs(value) else os.path.join(game_dir, value))
+            # "hl2/hl2_pak.vpk" in gameinfo means hl2/hl2_pak_dir.vpk on disk.
+            for cand in (path[:-4] + "_dir.vpk", path):
+                if os.path.isfile(cand) and cand not in vpks:
+                    vpks.append(cand)
+                    break
+        if vpks:
+            return vpks, gameinfo
+    return [], None
+
+
+def fallback_vpks(game_dir):
+    names = sorted(os.listdir(game_dir), key=lambda n: (
+        FALLBACK_GAME_FOLDERS.index(n.lower()) if n.lower() in FALLBACK_GAME_FOLDERS else 99, n.lower()))
+    vpks = []
+    for sub in names:
+        folder = os.path.join(game_dir, sub)
+        if not os.path.isdir(folder) or sub.lower() in ("bin", "custom", "download", "addons"):
+            continue
+        for name in sorted(os.listdir(folder)):
+            if name.lower().endswith(".vpk") and not VPK_ARCHIVE_PART.search(name):
+                vpks.append(os.path.join(folder, name))
+    return vpks
+
+
+def read_base_game(game_dir):
+    """The original game's files as the game sees them: path -> (size, crc32).
+    Returns (files, number of VPKs read, where the list of VPKs came from, errors)."""
+    vpks, source = gameinfo_vpks(game_dir)
+    if not vpks:
+        vpks, source = fallback_vpks(game_dir), "the game folders (gameinfo.txt not readable)"
+    base = Addon(name="Half-Life 2 (base game)", location=game_dir)
+    errors = []
+    for vpk in vpks:
+        part = Addon(name=vpk, location=vpk)
+        try:
+            read_packed_file(part, vpk)
+        except READ_ERRORS as e:
+            errors.append("%s: %s" % (vpk, e))
+        for path, content in part.files.items():
+            base.files.setdefault(path, content)  # first in the search path wins
+    return base.files, len(vpks), source, errors
+
+
+# ---------------------------------------------------------------------------
 # Finding Steam
 # ---------------------------------------------------------------------------
 
@@ -532,39 +606,46 @@ def severity(path):
     return 2 if path.startswith(SEVERE_DIRS) else 1 if path.startswith("models/") else 0
 
 
-def find_idle_addons(addons, by_path):
+def find_idle_addons(addons, by_path, base=None):
     """
     Works out what each addon actually contributes. A file does nothing when
-    an addon that loads ahead of it overwrites it, or when another addon has an
-    identical copy that would take over. Addons where every file does nothing
-    can be removed without changing the game.
+    an addon that loads ahead of it overwrites it, when another addon has an
+    identical copy that would take over, or when it's identical to the base
+    game's own file and no other addon has it. Addons where every file does
+    nothing can be removed without changing the game.
 
     Addons are checked least important first, and each removable one is taken
     out before checking the next, so all of them can be removed together
     (of two identical addons, only the one that loses is removable).
+
+    Results: (addon, overwritten_by, copies_in, unknown, same_as_base, reverted_by).
+    reverted_by counts files overwritten by an addon whose copy is the base game's own.
     """
+    base = base or {}
+
     def contribution(addon, removed):
-        overwritten_by, copies_in = defaultdict(int), defaultdict(int)
-        unknown = 0
+        overwritten_by, copies_in, reverted_by = defaultdict(int), defaultdict(int), defaultdict(int)
+        unknown = same_as_base = 0
         for path, content in addon.files.items():
             others = [c for c in by_path[path] if c[0] is not addon and c[0] not in removed]
             if not others:
-                continue  # only this addon has it: needed
+                # Only this addon has it: without it, the game's own file is used.
+                if base.get(path) == content:
+                    same_as_base += 1
+                continue
             if known(addon, *(c[0] for c in others)):
                 best = by_rank(others)[0]
                 if (best[1], best[2]) == content:
                     copies_in[best[0].name] += 1  # same file takes over (or already wins)
                 elif best[0].rank < addon.rank:
-                    overwritten_by[best[0].name] += 1
+                    winner_is_original = base.get(path) == (best[1], best[2])
+                    (reverted_by if winner_is_original else overwritten_by)[best[0].name] += 1
                 # else: this addon's copy is the one the game uses: needed
             elif all((c[1], c[2]) == content for c in others):
                 copies_in[others[0][0].name] += 1  # identical everywhere, order doesn't matter
             else:
                 unknown += 1
-        return overwritten_by, copies_in, unknown
-
-    def idle_count(stats):
-        return sum(stats[0].values()) + sum(stats[1].values())
+        return overwritten_by, copies_in, unknown, same_as_base, reverted_by
 
     removed, results = set(), []
     for addon in sorted(addons, key=lambda a: (a.rank is None, -(a.rank or 0))):
@@ -584,6 +665,13 @@ def find_idle_addons(addons, by_path):
     return removed, results
 
 
+def idle_count(stats):
+    """Files that do nothing, from find_idle_addons stats (with or without the addon in front)."""
+    if not isinstance(stats[0], dict):
+        stats = stats[1:]
+    return sum(stats[0].values()) + sum(stats[1].values()) + stats[3] + sum(stats[4].values())
+
+
 def index_files(addons):
     by_path = defaultdict(list)  # path -> [(addon, size, crc)]
     for addon in addons:
@@ -592,7 +680,8 @@ def index_files(addons):
     return by_path
 
 
-def analyze(addons, min_dupe_size):
+def analyze(addons, min_dupe_size, base=None):
+    base = base or {}
     by_path = index_files(addons)
 
     conflicts, same_path = [], []
@@ -630,8 +719,17 @@ def analyze(addons, min_dupe_size):
                 counts[1] += severity(path) == 2
     pairs = sorted(pair_counts.items(), key=lambda item: (-item[1][0], item[0][0].name, item[0][1].name))
 
-    removed, idle = find_idle_addons(addons, by_path)
-    return conflicts, same_path, content_dupes, pairs, removed, idle
+    removed, idle = find_idle_addons(addons, by_path, base)
+
+    # Files identical to the base game's own, per addon, most first.
+    base_copies = []
+    for addon in addons:
+        same = sorted(p for p, content in addon.files.items() if base.get(p) == content)
+        if same:
+            base_copies.append((addon, same))
+    base_copies.sort(key=lambda item: (-len(item[1]), item[0].name.lower()))
+
+    return conflicts, same_path, content_dupes, pairs, removed, idle, base_copies, base
 
 
 def nice_size(n):
@@ -650,8 +748,8 @@ def label(addon):
     return addon.name + ("  [#%d]" % addon.position if addon.position else "")
 
 
-def format_report(addons, skipped, containers, load_order, analysis, limit):
-    conflicts, same_path, content_dupes, pairs, removed, idle = analysis
+def format_report(addons, skipped, containers, load_order, analysis, limit, base_info=""):
+    conflicts, same_path, content_dupes, pairs, removed, idle, base_copies, base = analysis
     out = []
     w = out.append
 
@@ -672,6 +770,7 @@ def format_report(addons, skipped, containers, load_order, analysis, limit):
         w("  [#N] = position in that list. " + LOAD_ORDER_NOTE)
     else:
         w("Load order: not found, so the report can't say which addon wins a conflict.")
+    w("Base game: " + (base_info or "not checked"))
     w("")
 
     def more(i, items):
@@ -701,33 +800,55 @@ def format_report(addons, skipped, containers, load_order, analysis, limit):
         for line in explain:
             w(line)
         w("")
-        for i, (addon, over, copies, unknown) in enumerate(entries):
+        for i, (addon, over, copies, unknown, same_as_base, reverted) in enumerate(entries):
             if more(i, entries):
                 break
             n = len(addon.files)
-            idle_n = sum(over.values()) + sum(copies.values())
+            idle_n = idle_count((over, copies, unknown, same_as_base, reverted))
             if idle_n == n:
                 w("  %s  (%s)" % (label(addon), plural(n, "file")))
             else:
                 w("  %s  (%d%% of %s do nothing)" % (label(addon), 100 * idle_n // n, plural(n, "file")))
             if over:
                 w("      overwritten by: " + top(over))
+            if reverted:
+                w("      undone back to the original by: " + top(reverted))
             if copies:
                 w("      identical copies in: " + top(copies))
+            if same_as_base:
+                w("      identical to the base game: %s" % plural(same_as_base, "file"))
             if unknown:
                 w("      %s: winner unknown (load order not known)" % plural(unknown, "file"))
         w("")
 
     nothing = [e for e in idle if e[0] in removed]
     mostly = sorted((e for e in idle if e[0] not in removed),
-                    key=lambda e: -(sum(e[1].values()) + sum(e[2].values())) / len(e[0].files))
+                    key=lambda e: -idle_count(e) / len(e[0].files))
     idle_entries(nothing, "ADDONS THAT DO NOTHING", [
-        "Every file in these is overwritten by an addon that loads ahead of it, or is",
-        "an exact copy of a file another addon provides. Removing them changes nothing",
-        "in game. They were checked together, so you can remove all of them."])
+        "Every file in these is overwritten by an addon that loads ahead of it, is an",
+        "exact copy of a file another addon provides, or is identical to the base game's",
+        "own file. Removing them changes nothing in game. They were checked together,",
+        "so you can remove all of them."])
     idle_entries(mostly, "ADDONS THAT MOSTLY DO NOTHING", [
         "At least half of these addons' files are overwritten or duplicated elsewhere.",
         "They still change something, so check what's left before removing them."])
+
+    if base:
+        total = sum(len(paths) for _, paths in base_copies)
+        w("== ADDONS WITH COPIES OF BASE GAME FILES (%d addons, %s) ==" % (len(base_copies), plural(total, "file")))
+        w("These files are identical to the game's own. On their own they change nothing,")
+        w("but one can undo another addon's change to that file if it wins over it.")
+        w("")
+        for i, (addon, paths) in enumerate(base_copies):
+            if more(i, base_copies):
+                break
+            w("  %s  (%d of %s)" % (label(addon), len(paths), plural(len(addon.files), "file")))
+            shown = paths if not limit else paths[:5]
+            for p in shown:
+                w("      " + p)
+            if len(paths) > len(shown):
+                w("      ... and %d more" % (len(paths) - len(shown)))
+        w("")
 
     w("== ADDON PAIRS WITH THE MOST CONFLICTS (%d) ==" % len(pairs))
     w("Each pair overwrites this many of each other's files.")
@@ -756,8 +877,10 @@ def format_report(addons, skipped, containers, load_order, analysis, limit):
         tag = {2: "[!] ", 1: "[MODEL] "}.get(severity(path), "")
         w("  %s%s" % (tag, path))
         order_known = known(*(a for a, _, _ in copies))
-        for n, (addon, size, _) in enumerate(copies):
+        for n, (addon, size, crc) in enumerate(copies):
             mark = ("  <- used" if n == 0 else "") if order_known else ""
+            if base.get(path) == (size, crc):
+                mark = "  [same as base game]" + mark
             w("      %s  (%s)%s" % (label(addon), nice_size(size), mark))
     w("")
 
@@ -800,6 +923,23 @@ def format_report(addons, skipped, containers, load_order, analysis, limit):
 LOAD_ORDER_NOTE = "Assumes the addon higher in the list wins."
 
 
+def guess_game_dir(chosen, containers):
+    """--game-dir, else the Half-Life 2 folder next to the scanned Workshop or custom folders."""
+    if chosen:
+        return resolve_game_dir(chosen)
+    for c in containers:
+        c = os.path.abspath(c)
+        if os.path.basename(c) == HL2_APPID:
+            game = game_dir_for_workshop(c)
+        elif os.path.basename(c).lower() == "custom":
+            game = resolve_game_dir(os.path.dirname(os.path.dirname(c)))
+        else:
+            game = None
+        if game:
+            return game
+    return find_hl2_dirs()[0]
+
+
 def main():
     global LOAD_ORDER_NOTE
     ap = argparse.ArgumentParser(description="Find Half-Life 2 addons that conflict or duplicate each other.")
@@ -814,6 +954,9 @@ def main():
                     help="the game's workshop.txt (default: Half-Life 2/hl2_complete/cfg/workshop.txt)")
     ap.add_argument("--last-wins", action="store_true",
                     help="the addon lower in workshop.txt wins conflicts, instead of the higher one")
+    ap.add_argument("--game-dir", metavar="FOLDER",
+                    help="the Half-Life 2 folder, for comparing addons with the base game (default: found automatically)")
+    ap.add_argument("--no-base-game", action="store_true", help="don't compare addons with the base game's files")
     ap.add_argument("--all", action="store_true",
                     help="also check disabled addons and ones missing from workshop.txt")
     args = ap.parse_args()
@@ -882,11 +1025,26 @@ def main():
          "These only hold cache files, left behind by addons you removed. Safe to delete."),
     ]
 
-    analysis = analyze(addons, args.min_dupe_size)
-    with open(args.out, "w", encoding="utf-8") as f:
-        f.write(format_report(addons, skipped, containers, load_order, analysis, 0))
+    base, base_info = {}, "not checked (--no-base-game)" if args.no_base_game else ""
+    if not args.no_base_game:
+        game = guess_game_dir(args.game_dir, containers)
+        if not game:
+            base_info = "Half-Life 2 folder not found, so files weren't compared with it (use --game-dir)"
+        else:
+            print("Reading the base game's files...", file=sys.stderr)
+            base, vpk_count, source, errors = read_base_game(game)
+            if vpk_count:
+                base_info = "%d files from %s, as listed in %s" % (len(base), plural(vpk_count, "VPK"), source)
+            else:
+                base_info = "no VPKs found in %s, so files weren't compared with it" % game
+            for e in errors:
+                print("Base game: " + e, file=sys.stderr)
 
-    print(format_report(addons, skipped, containers, load_order, analysis, args.limit))
+    analysis = analyze(addons, args.min_dupe_size, base)
+    with open(args.out, "w", encoding="utf-8") as f:
+        f.write(format_report(addons, skipped, containers, load_order, analysis, 0, base_info))
+
+    print(format_report(addons, skipped, containers, load_order, analysis, args.limit, base_info))
     print("Full report: " + os.path.abspath(args.out))
 
     if pause:

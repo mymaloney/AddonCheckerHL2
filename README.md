@@ -6,6 +6,7 @@ addons (`steamapps/workshop/content/220`) and your `custom/` folders, and report
 | Section | Meaning |
 |---|---|
 | **Addons that do nothing** | Every file is overwritten by an addon that loads ahead of it, or is an exact copy of a file another addon provides. Safe to remove; they're checked together, so you can remove all of them at once. |
+| **Addons with copies of base game files** | Files identical to the game's own. They change nothing, unless they win over another addon's version and so put the original back. Conflicts mark such copies `[same as base game]`. |
 | **Addons that mostly do nothing** | At least half the files are overwritten or duplicated. They still change something. |
 | **Addon pairs with the most conflicts** | Which addons fight the most, and which one wins. |
 | **Conflicts** | Two addons ship the same file with **different** contents. The game only uses one, so the other addon is partly broken. |
@@ -89,6 +90,19 @@ folder; tkinter comes with the python.org installer on Windows.
 
 If a Workshop item uses a format the tool doesn't recognize, the report lists it under
 **Problems reading addons**, with the file's first bytes, so support can be added.
+
+## Base game files
+
+Addons are also compared with Half-Life 2's own files. The tool reads the VPKs listed in
+`hl2_complete/gameinfo.txt` (or `hl2/gameinfo.txt`), in the game's order, so where Episode Two
+replaces a Half-Life 2 file, the Episode Two version counts as the original.
+
+- A file identical to the original counts as doing nothing, unless it beats another addon's
+  version of that file. In that case it puts the original back, and the losing addon is reported
+  as "undone back to the original by" it.
+- Only VPKs are read. Loose files in the game folders aren't compared.
+- `--game-dir FOLDER` points at the Half-Life 2 folder if it isn't found automatically;
+  `--no-base-game` skips the comparison.
 
 ## Load order
 

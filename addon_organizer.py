@@ -78,6 +78,10 @@ class Organizer:
         self.game_dir = None      # chosen in the Folders window; None = find automatically
         self.workshop_dir = None
         self.found_game = self.found_workshop = None  # what the last scan used
+        self.base = {}            # the original game's files: path -> (size, crc)
+        self.base_info = ""
+        # Stands in for the original game in the Conflicts tab.
+        self.base_addon = ac.Addon(name="Half-Life 2 (original game files)", location="(base game)")
         self.leftovers = []
         self.rules = []           # [{"winner": id, "loser": id}]
         self.last_wins = tk.BooleanVar(value=False)
@@ -278,13 +282,20 @@ class Organizer:
                     elif a.workshop_id:
                         a.name = "Workshop item %s" % a.workshop_id
             entries = ac.read_load_order(path) if path else []
+            base, base_info = {}, "original game files not checked (Half-Life 2 folder not found)"
+            if game:
+                self.root.after(0, lambda: self.status.config(text="Reading the original game files..."))
+                base, vpk_count, _, _ = ac.read_base_game(game)
+                base_info = ("compared with %d original game files" % len(base) if vpk_count
+                             else "no original game VPKs found, so files weren't compared with them")
         except Exception as e:  # report anything unexpected instead of dying silently
             message = str(e)
             self.root.after(0, lambda: messagebox.showerror("Scan failed", message))
             return
-        self.root.after(0, lambda: self.scan_done(game, workshop, addons, path, entries))
+        self.root.after(0, lambda: self.scan_done(game, workshop, addons, path, entries, base, base_info))
 
-    def scan_done(self, game, workshop, addons, path, entries):
+    def scan_done(self, game, workshop, addons, path, entries, base=None, base_info=""):
+        self.base, self.base_info = base or {}, base_info
         self.found_game, self.found_workshop = game, workshop
         if not game or not workshop:
             missing = [n for n, d in (("Half-Life 2", game), ("Workshop", workshop)) if not d]
@@ -328,7 +339,7 @@ class Organizer:
             active.append(a)
 
         self.by_path = ac.index_files(active)
-        self.removable, idle = ac.find_idle_addons(active, self.by_path)
+        self.removable, idle = ac.find_idle_addons(active, self.by_path, self.base)
         self.idle = {e[0]: e for e in idle}
 
         # Per addon: files where it beats / loses to a different copy.
@@ -368,6 +379,8 @@ class Organizer:
         return a.workshop_id or "custom:" + a.location
 
     def addon_for_key(self, key):
+        if key == self.addon_key(self.base_addon):
+            return self.base_addon
         if key.startswith("custom:"):
             return next((a for a in self.addons if "custom:" + a.location == key), None)
         return self.by_id.get(key)
@@ -385,7 +398,7 @@ class Organizer:
             return "custom/ (always loaded)"
         if a in self.idle:
             e = self.idle[a]
-            pct = 100 * (sum(e[1].values()) + sum(e[2].values())) // max(len(a.files), 1)
+            pct = 100 * ac.idle_count(e) // max(len(a.files), 1)
             return "mostly nothing (%d%%)" % pct
         return ""
 
@@ -682,6 +695,8 @@ class Organizer:
             parts.append("%d not in workshop.txt yet" % unlisted)
         if self.leftovers:
             parts.append("%d leftover folders from removed addons" % len(self.leftovers))
+        if self.base_info:
+            parts.append(self.base_info)
         parts.append("UNSAVED CHANGES" if self.is_dirty() else "saved")
         self.status.config(text="   |   ".join(parts))
         self.save_btn.state(["!disabled"] if self.is_dirty() else ["disabled"])
@@ -696,11 +711,14 @@ class Organizer:
             self.refresh_details()
 
     def relations(self, addon):
-        """other addon -> {"wins": [paths], "loses": [paths], "same": [paths]}"""
-        rel = defaultdict(lambda: {"wins": [], "loses": [], "same": [], "unknown": []})
+        """other addon -> {"wins": [paths], "loses": [paths], "reverted": [paths], "same": [paths], ...}
+        The original game appears as self.base_addon, with the files this addon leaves unchanged."""
+        rel = defaultdict(lambda: {"wins": [], "loses": [], "reverted": [], "same": [], "unknown": []})
         if addon.rank is None and addon.workshop_id:
             return rel  # not loaded
         for path, content in addon.files.items():
+            if self.base.get(path) == content:
+                rel[self.base_addon]["same"].append(path)
             copies = self.by_path.get(path, [])
             for other, size, crc in copies:
                 if other is addon:
@@ -711,21 +729,27 @@ class Organizer:
                     rel[other]["unknown"].append(path)
                 elif addon.rank < other.rank:
                     rel[other]["wins"].append(path)
+                elif self.base.get(path) == (size, crc):
+                    rel[other]["reverted"].append(path)  # loses to a copy of the original file
                 else:
                     rel[other]["loses"].append(path)
         return rel
 
     def file_state(self, addon, path, content):
         copies = [c for c in self.by_path.get(path, []) if c[0] is not addon]
+        original = self.base.get(path) == content
         if not copies:
-            return "used (only this addon)"
+            return "same as the original game file" if original else "used (only this addon)"
         if not ac.known(addon, *(c[0] for c in copies)):
             return "load order unknown"
         best = ac.by_rank(copies + [(addon,) + content])[0]
         if best[0] is addon:
-            return "used, over %d other%s" % (len(copies), "" if len(copies) == 1 else "s")
+            others = ac.plural(len(copies), "other")
+            return ("used: puts back the original file over %s" % others) if original else "used, over " + others
         if (best[1], best[2]) == content:
             return "identical copy in " + best[0].name
+        if self.base.get(path) == (best[1], best[2]):
+            return "undone to the original by " + best[0].name
         return "overwritten by " + best[0].name
 
     def rule_between(self, a, b):
@@ -754,11 +778,12 @@ class Organizer:
         rel = self.relations(a)
         def weight(item):
             other, r = item
-            return -(len(r["wins"]) + len(r["loses"]) + len(r["unknown"])), -len(r["same"]), other.name.lower()
+            conflicts = len(r["wins"]) + len(r["loses"]) + len(r["reverted"]) + len(r["unknown"])
+            return other is self.base_addon, -conflicts, -len(r["same"]), other.name.lower()
         for other, r in sorted(rel.items(), key=weight):
             parts = []
-            if r["loses"]:
-                parts.append("loses %d" % len(r["loses"]))
+            if r["loses"] or r["reverted"]:
+                parts.append("loses %d" % (len(r["loses"]) + len(r["reverted"])))
             if r["wins"]:
                 parts.append("wins %d" % len(r["wins"]))
             if r["unknown"]:
@@ -773,14 +798,14 @@ class Organizer:
                 if self.rule_broken(rule):
                     rule_text += " ✗"
                     tags.append("broken")
-            severe = sum(ac.severity(p) == 2 for p in r["wins"] + r["loses"] + r["unknown"])
+            severe = sum(ac.severity(p) == 2 for p in r["wins"] + r["loses"] + r["reverted"] + r["unknown"])
             if severe:
                 tags.append("severe")
                 parts.append("%d [!]" % severe)
             node = self.conf_tree.insert("", "end", iid="o:" + self.addon_key(other), text=other.name, tags=tags,
                                          values=(other.position or "", ", ".join(parts), rule_text))
-            for kind, label in (("loses", "overwritten by it"), ("wins", "overwrites it"),
-                                ("unknown", "order unknown"), ("same", "identical")):
+            for kind, label in (("loses", "overwritten by it"), ("reverted", "undone to the original by it"),
+                                ("wins", "overwrites it"), ("unknown", "order unknown"), ("same", "identical")):
                 for path in sorted(r[kind]):
                     self.conf_tree.insert(node, "end", text=path, values=("", label, ""),
                                           tags=("severe",) if ac.severity(path) == 2 and kind != "same" else ())
@@ -814,6 +839,9 @@ class Organizer:
         a, other = self.selected, self.selected_other()
         if not a or not other:
             messagebox.showinfo("Add a rule", "Select an addon on the left, then one of its conflicts here.")
+            return
+        if other is self.base_addon:
+            messagebox.showinfo("Add a rule", "Addons always win over the original game files.")
             return
         if not a.workshop_id or not other.workshop_id:
             messagebox.showinfo("Add a rule", "custom/ addons aren't in the load order, so rules can't move them.")
