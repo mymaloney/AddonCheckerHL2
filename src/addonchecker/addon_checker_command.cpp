@@ -8,11 +8,15 @@
 //   addon_check_dupe_minsize    smallest file checked for content duplicates
 // Launch option:
 //   -addoncheck                 run the scan once when the game starts
+//
+// The scan runs on a worker thread so the game doesn't freeze while it reads
+// big loose-file addons; the report is printed once it finishes.
 //========================================================================
 #include "cbase.h"
 #include "filesystem.h"
 #include "tier0/icommandline.h"
 #include "igamesystem.h"
+#include "tier0/threadtools.h"
 
 #include "addon_scanner.h"
 
@@ -59,12 +63,20 @@ static void GetCustomDirs( const std::vector<std::string> &loadOrder, std::vecto
 {
 	dirs.push_back( std::string( engine->GetGameDirectory() ) + "/custom" );
 
+	// An addon's search path is <somewhere>/custom/<addon>/ or <somewhere>/custom/<addon>.vpk,
+	// so look at its parent folder rather than for "/custom/" anywhere in the path.
 	for ( size_t i = 0; i < loadOrder.size(); i++ )
 	{
-		std::string norm = AddonChecker::NormalizePath( loadOrder[i] );
-		size_t pos = norm.find( "/custom/" );
-		if ( pos != std::string::npos )
-			dirs.push_back( loadOrder[i].substr( 0, pos + 7 ) ); // keep original case for the OS
+		std::string path = loadOrder[i];
+		while ( !path.empty() && ( path[path.size() - 1] == '/' || path[path.size() - 1] == '\\' ) )
+			path.erase( path.size() - 1 );
+		size_t slash = path.find_last_of( "/\\" );
+		if ( slash == std::string::npos )
+			continue;
+		std::string parent = path.substr( 0, slash ); // keep original case for the OS
+		std::string norm = AddonChecker::NormalizePath( parent );
+		if ( norm.size() >= 7 && norm.compare( norm.size() - 7, 7, "/custom" ) == 0 )
+			dirs.push_back( parent );
 	}
 }
 
@@ -92,21 +104,33 @@ static void PrintReport( const std::string &text )
 	}
 }
 
-static void RunAddonCheck( const std::vector<std::string> &explicitDirs )
+class CAddonScanThread : public CThread
 {
-	std::vector<std::string> loadOrder;
-	GetLoadOrder( loadOrder );
+public:
+	CAddonScanThread() : m_MinDupeSize( 1 ) {}
 
-	std::vector<std::string> dirs = explicitDirs;
-	if ( dirs.empty() )
-		GetCustomDirs( loadOrder, dirs );
+	virtual int Run()
+	{
+		m_Report = AddonChecker::Scan( m_Dirs, m_LoadOrder, m_MinDupeSize );
+		m_Done = 1;
+		return 0;
+	}
 
-	for ( size_t i = 0; i < dirs.size(); i++ )
-		Msg( "[Addon Checker] Scanning %s\n", dirs[i].c_str() );
+	// Set on the main thread before Start(), read by the worker.
+	std::vector<std::string> m_Dirs;
+	std::vector<std::string> m_LoadOrder;
+	uint64_t                 m_MinDupeSize;
 
-	AddonChecker::Report report = AddonChecker::Scan( dirs, loadOrder,
-		(uint64_t)MAX( addon_check_dupe_minsize.GetInt(), 1 ) );
+	// Set by the worker; read on the main thread once m_Done is set.
+	AddonChecker::Report     m_Report;
+	CInterlockedInt          m_Done;
+};
 
+static CAddonScanThread *s_pScan = NULL;
+
+// Main thread: write the report file and print the summary.
+static void FinishAddonCheck( const AddonChecker::Report &report )
+{
 	FileHandle_t fh = g_pFullFileSystem->Open( REPORT_FILE, "wb", "MOD" );
 	if ( fh )
 	{
@@ -123,25 +147,78 @@ static void RunAddonCheck( const std::vector<std::string> &explicitDirs )
 		Warning( "[Addon Checker] Could not write %s\n", REPORT_FILE );
 }
 
+static void StartAddonCheck( const std::vector<std::string> &explicitDirs )
+{
+	if ( s_pScan )
+	{
+		Msg( "[Addon Checker] A scan is already running.\n" );
+		return;
+	}
+
+	// Everything that touches the engine happens here, on the main thread.
+	CAddonScanThread *scan = new CAddonScanThread;
+	GetLoadOrder( scan->m_LoadOrder );
+	scan->m_Dirs = explicitDirs;
+	if ( scan->m_Dirs.empty() )
+		GetCustomDirs( scan->m_LoadOrder, scan->m_Dirs );
+	scan->m_MinDupeSize = (uint64_t)MAX( addon_check_dupe_minsize.GetInt(), 1 );
+
+	for ( size_t i = 0; i < scan->m_Dirs.size(); i++ )
+		Msg( "[Addon Checker] Scanning %s\n", scan->m_Dirs[i].c_str() );
+
+	scan->SetName( "AddonChecker" );
+	if ( scan->Start() )
+	{
+		s_pScan = scan; // CAddonCheckSystem::Update() picks up the result
+		return;
+	}
+
+	// Couldn't start a thread: scan here instead.
+	scan->Run();
+	FinishAddonCheck( scan->m_Report );
+	delete scan;
+}
+
 CON_COMMAND( addon_check, "Check custom/ addons for conflicting and duplicate files. Optional: folders to scan instead." )
 {
 	std::vector<std::string> dirs;
 	for ( int i = 1; i < args.ArgC(); i++ )
 		dirs.push_back( args[i] );
-	RunAddonCheck( dirs );
+	StartAddonCheck( dirs );
 }
 
-// -addoncheck on the command line runs the scan once at startup.
-class CAddonCheckStartup : public CAutoGameSystem
+class CAddonCheckSystem : public CAutoGameSystemPerFrame
 {
 public:
-	CAddonCheckStartup() : CAutoGameSystem( "CAddonCheckStartup" ) {}
+	CAddonCheckSystem() : CAutoGameSystemPerFrame( "CAddonCheckSystem" ) {}
 
+	// -addoncheck on the command line runs the scan once at startup.
 	virtual void PostInit()
 	{
 		if ( CommandLine()->CheckParm( "-addoncheck" ) )
-			RunAddonCheck( std::vector<std::string>() );
+			StartAddonCheck( std::vector<std::string>() );
+	}
+
+	// Runs every frame, in the menus too.
+	virtual void Update( float /*frametime*/ )
+	{
+		if ( !s_pScan || !s_pScan->m_Done )
+			return;
+		s_pScan->Join();
+		FinishAddonCheck( s_pScan->m_Report );
+		delete s_pScan;
+		s_pScan = NULL;
+	}
+
+	// Quitting mid-scan: wait for the worker, the DLL is about to unload.
+	virtual void Shutdown()
+	{
+		if ( !s_pScan )
+			return;
+		s_pScan->Join();
+		delete s_pScan;
+		s_pScan = NULL;
 	}
 };
 
-static CAddonCheckStartup s_AddonCheckStartup;
+static CAddonCheckSystem s_AddonCheckSystem;

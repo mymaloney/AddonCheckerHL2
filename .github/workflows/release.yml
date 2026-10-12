@@ -1,0 +1,54 @@
+name: Windows build
+
+# Builds the .exe files on every push, so a broken build shows up right away.
+# Pushing a tag like v1.0.0 also publishes them as a GitHub release.
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install PyInstaller
+        run: python -m pip install "pyinstaller>=6,<7"
+      - name: Build
+        run: |
+          pyinstaller --onefile --name addon_checker addon_checker.py
+          pyinstaller --onefile --windowed --name addon_organizer addon_organizer.py
+      - name: Smoke test
+        shell: pwsh
+        run: |
+          $v = & dist\addon_checker.exe --version
+          Write-Output $v
+          if ($LASTEXITCODE -ne 0 -or $v -notmatch "HL2 Addon Checker") { exit 1 }
+          if (-not (Test-Path dist\addon_organizer.exe)) { exit 1 }
+      - name: Package
+        shell: pwsh
+        run: |
+          $name = "HL2-Addon-Checker-" + ($env:GITHUB_REF_NAME -replace '[^A-Za-z0-9._-]', '-') + "-windows"
+          New-Item -ItemType Directory $name | Out-Null
+          Copy-Item dist\addon_checker.exe, dist\addon_organizer.exe, README.md, LICENSE, CHANGELOG.md, addon_checker.py, addon_organizer.py $name
+          Compress-Archive -Path $name -DestinationPath "$name.zip"
+          "ZIP=$name.zip" | Out-File -FilePath $env:GITHUB_ENV -Append
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-build
+          path: ${{ env.ZIP }}
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ env.ZIP }}
+          body: |
+            ⚠️ **This project was vibe-coded:** written largely by an AI model, directed and tested by a person. There is **no warranty**. Back up your addons and `hl2_complete/cfg/workshop.txt` before using it, and read the warnings in the README.
+
+            Download the zip below, unpack it anywhere, and run `addon_organizer.exe` (the window) or `addon_checker.exe` (the report). Windows SmartScreen may warn about an unsigned program; the `.py` files in the zip are the same tools if you'd rather run them with Python.
+
+            See CHANGELOG.md for what's in this version.

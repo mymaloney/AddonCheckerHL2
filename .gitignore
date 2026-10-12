@@ -43,3 +43,10 @@ luac.out
 # Standalone checker build
 /addon_checker
 addon_report.txt
+__pycache__/
+addon_rules.json
+addon_titles.json
+addon_rules.json.broken*
+build/
+dist/
+*.spec
