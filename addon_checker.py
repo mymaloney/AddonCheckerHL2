@@ -538,15 +538,54 @@ def game_dir_for_workshop(workshop_dir):
     return resolve_game_dir(os.path.join(steamapps, "common", "Half-Life 2"))
 
 
+def has_game_files(game_dir):
+    """True for a real install: the game's own VPKs are there, not just leftover config folders."""
+    for sub in ("hl2", "hl2_complete", "ep2", "episodic"):
+        try:
+            if any(n.lower().endswith("_dir.vpk") for n in os.listdir(os.path.join(game_dir, sub))):
+                return True
+        except OSError:
+            pass
+    return False
+
+
+def count_workshop_items(workshop_dir):
+    try:
+        return sum(1 for n in os.listdir(workshop_dir) if n.isdigit())
+    except OSError:
+        return 0
+
+
 def find_hl2_dirs():
-    """(Half-Life 2 folder, Workshop folder) from Steam's libraries; either can be None."""
-    game = workshop = None
+    """
+    (Half-Life 2 folder, Workshop folder) from Steam's libraries; either can be None.
+    Several libraries can have a Half-Life 2 folder (an old install leaves cfg folders
+    behind), so prefer the one with the game's files, next to the Workshop folder.
+    """
+    libs, seen = [], set()
     for root in steam_roots():
         for lib in library_folders(root):
-            game = game or resolve_game_dir(os.path.join(lib, "steamapps", "common", "Half-Life 2"))
-            workshop = workshop or resolve_workshop_dir(os.path.join(lib, "steamapps", "workshop", "content", HL2_APPID))
-    if game and workshop_dir_for_game(game):
-        workshop = workshop_dir_for_game(game)
+            key = os.path.normcase(os.path.realpath(lib))
+            if key not in seen:
+                seen.add(key)
+                libs.append(lib)
+
+    candidates = []
+    for n, lib in enumerate(libs):
+        game = resolve_game_dir(os.path.join(lib, "steamapps", "common", "Half-Life 2"))
+        workshop = resolve_workshop_dir(os.path.join(lib, "steamapps", "workshop", "content", HL2_APPID))
+        if game or workshop:
+            items = count_workshop_items(workshop) if workshop else 0
+            score = (bool(game) and has_game_files(game), items > 0, bool(game), items, -n)
+            candidates.append((score, game, workshop))
+    if not candidates:
+        return None, None
+    candidates.sort(key=lambda c: c[0], reverse=True)
+    _, game, workshop = candidates[0]
+    if not workshop:  # Workshop items in another library than the game
+        workshop = next((w for _, _, w in candidates if w), None)
+    if not game:
+        game = next((g for _, g, _ in candidates if g), None)
     return game, workshop
 
 

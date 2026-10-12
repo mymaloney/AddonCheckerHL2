@@ -346,7 +346,24 @@ class Organizer:
         self.saved_order = [list(e) for e in self.order]
         self.backup_done = False
         self.selected = None
+        self.root.title("HL2 Addon Organizer - %s" % (game or workshop or "no folders"))
         self.recompute()
+        self.check_load_order_matches()
+
+    def check_load_order_matches(self):
+        """A workshop.txt that lists few of the installed addons is usually from the wrong folder."""
+        installed = [a for a in self.addons if a.workshop_id]
+        listed = [a for a in installed if a.position is not None]
+        if not self.load_order_path or len(installed) < 5 or len(listed) * 2 >= len(installed):
+            return
+        stale = len([w for w, _ in self.order if w not in self.by_id])
+        messagebox.showwarning(
+            "Load order doesn't match your addons",
+            "Only %d of your %d installed Workshop addons are in\n%s\n\n"
+            "and it lists %d addons that aren't installed. It may be from an old or different "
+            "Half-Life 2 folder: check Folders... (the folders in use are in the window title).\n\n"
+            "If the folder is right, start the game once so it updates the list."
+            % (len(listed), len(installed), self.load_order_path, stale))
 
     # ------------------------------------------------------------------ analysis
 
