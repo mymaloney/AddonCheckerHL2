@@ -12,11 +12,13 @@ Needs tkinter and a display; without them every test is skipped.
 import json
 import os
 import shutil
+import struct
 import sys
 import tempfile
 import threading
 import time
 import unittest
+import zipfile
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -737,6 +739,119 @@ class OrganizerTest(unittest.TestCase):
         self.assertEqual(app.status_text(app.by_id["222"]), "does nothing")
         self.assertEqual(app.status_text(app.by_id["111"]), "does nothing (only with 1 other)")
         self.assertEqual(app.flags(app.by_id["111"]), "✕")
+
+
+    # ---------------------------------------------------------------- custom/ addons and installing
+
+    def custom_dir(self):
+        return os.path.join(self.game, "hl2_complete", "custom")  # the first one the game loads
+
+    def row(self, key, col):
+        cols = [c[0] for c in ao.COLUMNS]
+        return self.app.tree.item(key, "values")[cols.index(col)]
+
+    def test_custom_addons_load_first(self):
+        write(os.path.join(self.game, "hl2", "custom", "aaa", "materials", "shared", "wall.vtf"), b"custom")
+        app = self.open()
+        rows = app.tree.get_children()
+        customs = ["custom:" + os.path.join(self.game, "hl2", "custom", n) for n in ("aaa", "mymod")]
+        self.assertEqual(list(rows[:2]), customs)
+        self.assertEqual([self.row(k, "pos") for k in customs], ["C1", "C2"])
+        # aaa's wall beats every Workshop addon's.
+        self.assertEqual(app.stats[app.addon_for_key(customs[0])][0], 1)
+        app.last_wins.set(True)
+        self.pump()
+        self.assertEqual(app.stats[app.addon_for_key(customs[0])][1], 1)  # now it loses
+
+    def install(self, *paths):
+        self.app.install_paths(list(paths))
+        self.wait()
+
+    def test_install_a_wrapped_folder(self):
+        app = self.open()
+        src = os.path.join(self.tmp, "download", "HD Crowbar")
+        write(os.path.join(src, "readme.txt"), b"thanks")
+        write(os.path.join(src, "HD Crowbar", "materials", "models", "crowbar.vtf"), b"vtf")
+        self.install(src)
+        dest = os.path.join(self.custom_dir(), "HD Crowbar")
+        self.assertTrue(os.path.isfile(os.path.join(dest, "materials", "models", "crowbar.vtf")))
+        self.assertTrue(os.path.isfile(os.path.join(src, "readme.txt")))  # copied, not moved
+        key = "custom:" + dest
+        self.assertIn(key, app.tree.get_children())
+        self.assertEqual(self.row(key, "pos"), "C1")
+
+    def test_install_a_split_vpk(self):
+        self.open()
+        src = os.path.join(self.tmp, "download")
+        for name in ("big_dir.vpk", "big_000.vpk", "big_001.vpk", "other.vpk"):
+            write(os.path.join(src, name), b"x")
+        self.install(os.path.join(src, "big_000.vpk"))  # dropping a part brings the whole set
+        self.assertEqual(sorted(os.listdir(self.custom_dir())), ["big_000.vpk", "big_001.vpk", "big_dir.vpk"])
+
+    def zip_file(self, name, members):
+        path = os.path.join(self.tmp, "download", name)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with zipfile.ZipFile(path, "w") as z:
+            for member, data in members.items():
+                z.writestr(member, data)
+        return path
+
+    def test_install_zips(self):
+        self.open()
+        folder_zip = self.zip_file("pack-v2.zip", {"Cool Pack/materials/a.vtf": b"a", "Cool Pack/readme.txt": b"r"})
+        loose_zip = self.zip_file("maps.zip", {"map_a.vpk": b"a", "map_b.vpk": b"b"})
+        flat_zip = self.zip_file("flat.zip", {"models/m.mdl": b"m", "credits.txt": b"c"})
+        self.install(folder_zip, loose_zip, flat_zip)
+        self.assertEqual(sorted(os.listdir(self.custom_dir())), ["Cool Pack", "flat", "map_a.vpk", "map_b.vpk"])
+        self.assertTrue(os.path.isfile(os.path.join(self.custom_dir(), "flat", "models", "m.mdl")))
+        self.assertEqual(self.dialogs, [])
+
+    def test_unsafe_and_unknown_files_arent_installed(self):
+        self.open()
+        evil = self.zip_file("evil.zip", {"../../outside.txt": b"x", "materials/a.vtf": b"a"})
+        rar = os.path.join(self.tmp, "download", "pack.rar")
+        write(rar, b"Rar!")
+        self.install(evil, rar)
+        self.assertFalse(os.path.exists(self.custom_dir()) and os.listdir(self.custom_dir()))
+        self.assertFalse(os.path.exists(os.path.join(self.tmp, "outside.txt")))
+        message = [d[2] for d in self.dialogs if d[1] == "Install addon"][0]
+        self.assertIn("outside its own folder", message)
+        self.assertIn("unpack it first", message)
+
+    def test_replacing_asks_first(self):
+        self.open()
+        old = os.path.join(self.custom_dir(), "pack", "materials", "old.vtf")
+        write(old, b"old")
+        src = os.path.join(self.tmp, "download", "pack")
+        write(os.path.join(src, "materials", "new.vtf"), b"new")
+        self.answers = [False]
+        self.install(src)
+        self.assertTrue(os.path.isfile(old))
+        self.answers = [True]
+        self.install(src)
+        self.assertFalse(os.path.exists(old))
+        self.assertTrue(os.path.isfile(os.path.join(self.custom_dir(), "pack", "materials", "new.vtf")))
+
+    @unittest.skipUnless(sys.platform == "win32", "drag and drop from Explorer is Windows only")
+    def test_drop_files_on_the_window(self):
+        import ctypes
+        from ctypes import wintypes
+        app = self.open()
+        self.assertTrue(app.file_drop)
+        src = os.path.join(self.tmp, "download", "dropped")
+        write(os.path.join(src, "materials", "d.vtf"), b"d")
+        # What Explorer sends: a DROPFILES block (offset of the names, point, flags, wide) and the names.
+        data = struct.pack("<IiiII", 20, 0, 0, 0, 1) + (src + "\0\0").encode("utf-16-le")
+        kernel32, user32 = ctypes.windll.kernel32, ctypes.windll.user32
+        kernel32.GlobalAlloc.restype = ctypes.c_void_p
+        kernel32.GlobalAlloc.argtypes = [wintypes.UINT, ctypes.c_size_t]
+        handle = kernel32.GlobalAlloc(0x0040, len(data))  # GPTR: fixed and zeroed; DragFinish frees it
+        ctypes.memmove(handle, data, len(data))
+        user32.SendMessageW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+        user32.SendMessageW(int(self.root.wm_frame(), 16), 0x0233, handle, 0)
+        self.pump()
+        self.wait()
+        self.assertTrue(os.path.isfile(os.path.join(self.custom_dir(), "dropped", "materials", "d.vtf")))
 
 
 if __name__ == "__main__":

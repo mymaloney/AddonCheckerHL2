@@ -515,6 +515,45 @@ class MixedModels(unittest.TestCase):
         self.assertEqual(self.mixed(a, b), [])
 
 
+class CustomLoadOrder(Base):
+    """custom/ addons load ahead of every Workshop addon, A to Z by folder name."""
+
+    def setup_folders(self):
+        lib, game, workshop = self.library(items={"111": {"scripts/w.txt": "workshop"}}, order=[("111", 1)],
+                                           custom={"hl2": {"b_mod": {"scripts/w.txt": "b"},
+                                                           "A_mod": {"scripts/w.txt": "a"}}})
+        return workshop, os.path.join(game, "hl2", "custom")
+
+    def winner(self, *args):
+        workshop, custom = self.setup_folders()
+        code, out = run_main("--offline", "--no-base-game", "--out", self.path("r.txt"), workshop, custom, *args)
+        lines = out.splitlines()
+        start = lines.index("  [!] scripts/w.txt")
+        return [l.strip() for l in lines[start + 1:start + 4]]
+
+    def test_custom_first_a_to_z(self):
+        self.assertEqual(self.winner(), ["hl2/custom/A_mod  (1 bytes)  <- used",
+                                         "hl2/custom/b_mod  (1 bytes)",
+                                         "workshop/111  [#1]  (8 bytes)"])
+
+    def test_last_wins_flips_it(self):
+        self.assertEqual(self.winner("--last-wins"), ["workshop/111  [#1]  (8 bytes)  <- used",
+                                                      "hl2/custom/b_mod  (1 bytes)",
+                                                      "hl2/custom/A_mod  (1 bytes)"])
+
+    def test_without_workshop_txt_custom_order_is_still_known(self):
+        self.addon("c", "b", {"scripts/w.txt": "b"})
+        self.addon("c", "a", {"scripts/w.txt": "a"})
+        code, out = run_main("--offline", "--no-base-game", "--out", self.path("r.txt"), self.path("c"))
+        self.assertIn("      tmp/c/a  (1 bytes)  <- used".replace("tmp", os.path.basename(self.tmp)), out)
+
+    def test_overwritten_custom_addon_is_removable(self):
+        top = addon("a", {"materials/x.vtf": "new"})
+        low = addon("b", {"materials/x.vtf": "old"})
+        ac.rank_custom_addons([top, low])
+        self.assertEqual(ac.find_idle_addons([top, low], ac.index_files([top, low]))[0], {low})
+
+
 # ---------------------------------------------------------------------------
 # Finding Steam and the game
 # ---------------------------------------------------------------------------

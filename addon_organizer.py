@@ -22,9 +22,11 @@ import stat
 import subprocess
 import sys
 import threading
+import tempfile
 import time
 import tkinter as tk
 import webbrowser
+import zipfile
 from collections import Counter, defaultdict
 from tkinter import filedialog, messagebox, simpledialog, ttk
 from tkinter import font as tkfont
@@ -196,6 +198,154 @@ def open_path(path):
         subprocess.Popen(["xdg-open", path])
 
 
+# ---------------------------------------------------------------------------
+# Installing custom/ addons
+# ---------------------------------------------------------------------------
+
+# Folders that hold game content: an addon folder has some of these at its top.
+CONTENT_DIRS = {"materials", "models", "sound", "maps", "scripts", "resource", "cfg", "particles", "scenes",
+                "media", "expressions", "shaders", "sounds"}
+
+
+class InstallError(Exception):
+    pass
+
+
+def addon_root(folder):
+    """An addon is often wrapped in one more folder ("myaddon/myaddon/materials"): skip such
+    wrappers, down to the folder that holds the content."""
+    while True:
+        try:
+            names = os.listdir(folder)
+        except OSError as e:
+            raise InstallError("can't open %s: %s" % (folder, e.strerror or e))
+        dirs = [n for n in names if os.path.isdir(os.path.join(folder, n))]
+        files = [n for n in names if not os.path.isdir(os.path.join(folder, n))]
+        if len(dirs) == 1 and dirs[0].lower() not in CONTENT_DIRS and \
+                not any(f.lower().endswith(".vpk") for f in files):
+            folder = os.path.join(folder, dirs[0])  # only readmes or nothing next to it
+            continue
+        return folder
+
+
+def vpk_parts(path):
+    """A dropped VPK and the files that belong with it: foo_dir.vpk comes with foo_000.vpk, foo_001.vpk...
+    (dropping a part brings the whole set)."""
+    folder, name = os.path.split(path)
+    m = re.match(r"(.*)_(?:dir|\d{3})\.vpk$", name, re.IGNORECASE)
+    if not m:
+        return [path]
+    stem = m.group(1).lower()
+    parts = [os.path.join(folder, n) for n in sorted(os.listdir(folder))
+             if re.match(re.escape(stem) + r"_(?:dir|\d{3})\.vpk$", n, re.IGNORECASE)]
+    if not any(p.lower().endswith("_dir.vpk") for p in parts):
+        raise InstallError("%s is only part of an addon: its %s_dir.vpk isn't next to it" % (name, m.group(1)))
+    return parts
+
+
+def plan_install(source, workdir):
+    """What dropping source installs: [(name in custom/, path to copy)]. A .zip is unpacked into workdir.
+    Raises InstallError for things that aren't addons."""
+    name = os.path.basename(os.path.normpath(source))
+    lower = name.lower()
+    if os.path.isdir(source):
+        root = addon_root(source)
+        return [(name, root)]
+    if lower.endswith(".vpk"):
+        return [(os.path.basename(p), p) for p in vpk_parts(source)]
+    if lower.endswith(".zip"):
+        try:
+            with zipfile.ZipFile(source) as z:
+                for member in z.namelist():
+                    parts = member.replace("\\", "/").split("/")
+                    if member.startswith(("/", "\\")) or ":" in parts[0] or ".." in parts:
+                        raise InstallError("%s has a file outside its own folder (%s); not installed" % (name, member))
+                target = os.path.join(workdir, "unpacked")
+                z.extractall(target)
+        except (zipfile.BadZipFile, RuntimeError, NotImplementedError, OSError) as e:
+            raise InstallError("can't unpack %s: %s" % (name, e))
+        root = addon_root(target)
+        entries = os.listdir(root)
+        vpks = [n for n in entries if n.lower().endswith(".vpk")]
+        if vpks and len(vpks) == len(entries) and not any(n.lower().startswith("pak01_") for n in vpks):
+            return [(n, os.path.join(root, n)) for n in sorted(vpks)]  # loose VPKs go in custom/ itself
+        top = os.path.basename(root) if root != target else os.path.splitext(name)[0]
+        return [(top, root)]
+    if lower.endswith((".7z", ".rar")):
+        raise InstallError("%s: unpack it first (7-Zip or WinRAR), then drop the folder" % name)
+    raise InstallError("%s isn't an addon: drop a folder, a .vpk or a .zip" % name)
+
+
+def copy_into(src, dest):
+    """Copies a file or folder to dest through a temporary name, so a failed copy leaves nothing half done."""
+    tmp = dest + ".installing"
+    if os.path.lexists(tmp):
+        shutil.rmtree(tmp) if os.path.isdir(tmp) else os.remove(tmp)
+    try:
+        if os.path.isdir(src):
+            shutil.copytree(src, tmp)
+        else:
+            shutil.copy2(src, tmp)
+        if os.path.lexists(dest):
+            shutil.rmtree(dest) if os.path.isdir(dest) and not os.path.islink(dest) else os.remove(dest)
+        os.replace(tmp, dest)
+    except BaseException:
+        if os.path.lexists(tmp):
+            shutil.rmtree(tmp, ignore_errors=True) if os.path.isdir(tmp) else os.remove(tmp)
+        raise
+
+
+def enable_file_drop(root, callback):
+    """Windows: files and folders dropped on the window from Explorer call callback([paths]).
+    Tk has no file drop of its own, so this listens for the WM_DROPFILES message Windows sends.
+    Returns False where that isn't possible."""
+    if sys.platform != "win32":
+        return False
+    try:
+        import ctypes
+        from ctypes import wintypes
+        user32, shell32 = ctypes.windll.user32, ctypes.windll.shell32
+        LRESULT = ctypes.c_ssize_t
+        WNDPROC = ctypes.WINFUNCTYPE(LRESULT, wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM)
+        set_proc = getattr(user32, "SetWindowLongPtrW", None) or user32.SetWindowLongW  # 32-bit Python
+        set_proc.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_void_p]
+        set_proc.restype = ctypes.c_void_p
+        user32.CallWindowProcW.argtypes = [ctypes.c_void_p, wintypes.HWND, wintypes.UINT, wintypes.WPARAM,
+                                           wintypes.LPARAM]
+        user32.CallWindowProcW.restype = LRESULT
+        shell32.DragQueryFileW.argtypes = [ctypes.c_void_p, wintypes.UINT, ctypes.c_wchar_p, wintypes.UINT]
+        shell32.DragQueryFileW.restype = wintypes.UINT
+        shell32.DragFinish.argtypes = [ctypes.c_void_p]
+        shell32.DragAcceptFiles.argtypes = [wintypes.HWND, wintypes.BOOL]
+        WM_DROPFILES, GWLP_WNDPROC = 0x0233, -4
+
+        root.update_idletasks()
+        hwnd = int(root.wm_frame(), 16)  # the top-level window around Tk's own
+
+        def proc(h, msg, wparam, lparam):
+            if msg == WM_DROPFILES:
+                paths = []
+                for i in range(shell32.DragQueryFileW(wparam, 0xFFFFFFFF, None, 0)):
+                    size = shell32.DragQueryFileW(wparam, i, None, 0) + 1
+                    buf = ctypes.create_unicode_buffer(size)
+                    shell32.DragQueryFileW(wparam, i, buf, size)
+                    paths.append(buf.value)
+                shell32.DragFinish(wparam)
+                root.after(0, lambda: callback(paths))  # outside this window message
+                return 0
+            return user32.CallWindowProcW(old, h, msg, wparam, lparam)
+
+        new = WNDPROC(proc)
+        old = set_proc(hwnd, GWLP_WNDPROC, ctypes.cast(new, ctypes.c_void_p))
+        if not old:
+            return False
+        root._file_drop = (new, old)  # the callback must live as long as the window
+        shell32.DragAcceptFiles(hwnd, True)
+        return True
+    except Exception:  # an unusual Windows or Python: install through the button instead
+        return False
+
+
 class Tooltip:
     def __init__(self, widget, text, theme):
         self.widget, self.text, self.theme = widget, text, theme
@@ -296,6 +446,7 @@ class Organizer:
         self.apply_theme()
         self.restore_layout()
         self.bind_keys()
+        self.file_drop = enable_file_drop(self.root, self.install_paths)
         self.poll_ui()
         self.filter_text.trace_add("write", lambda *_: self.refresh_list())
         self.view.trace_add("write", lambda *_: self.refresh_list())
@@ -507,6 +658,10 @@ class Organizer:
         f.add_command(label="Save load order", accelerator="Ctrl+S", command=self.save_order)
         f.add_command(label="Revert to saved", command=self.revert_order)
         f.add_separator()
+        f.add_command(label="Install addon files (.vpk, .zip)...", command=self.install_files)
+        f.add_command(label="Install addon folder...", command=self.install_folder)
+        f.add_command(label="Open custom folder", command=self.open_custom_folder)
+        f.add_separator()
         f.add_command(label="Rescan", accelerator="F5", command=self.start_scan)
         f.add_command(label="Folders...", command=self.choose_folders)
         f.add_command(label="Export report...", command=self.export_report)
@@ -578,6 +733,8 @@ class Organizer:
 
         rescan = ttk.Button(bar, text="⟳ Rescan", style="Tool.TButton", command=self.start_scan)
         rescan.pack(side="right")
+        install = ttk.Button(bar, text="＋ Install addon...", style="Tool.TButton", command=self.install_files)
+        install.pack(side="right", padx=(0, self.px(4)))
         folders = ttk.Button(bar, text="Folders...", style="Tool.TButton", command=self.choose_folders)
         folders.pack(side="right", padx=(0, self.px(4)))
         self.problems_btn = ttk.Button(bar, text="✓ No problems", style="Tool.TButton", command=self.show_problems)
@@ -589,6 +746,9 @@ class Organizer:
         Tooltip(sort_btn, "Reorder so every rule is met, moving each rule's winner just ahead of its loser.", theme)
         Tooltip(clean_btn, "Move every addon that does nothing to the end of the list where it loses. "
                            "The game plays the same, and they end up together for unsubscribing.", theme)
+        Tooltip(install, "Copy an addon (.vpk, .zip or a folder) into the game's custom folder. On Windows you can "
+                         "also drop files and folders on the window. custom/ addons load ahead of every Workshop "
+                         "addon, A to Z by name.", theme)
         Tooltip(save_profile, "Save the current load order and on/off states as a named profile.", theme)
         Tooltip(self.problems_btn, "Things that need attention: broken rules, unreadable addons, leftover "
                                    "folders and more.", theme)
@@ -1061,6 +1221,7 @@ class Organizer:
                     continue
                 a.rank = -n if last_wins else n
             active.append(a)
+        ac.rank_custom_addons(self.addons, last_wins)  # ahead of the Workshop ones, A to Z
 
         # Moving an addon doesn't change which files are loaded, only who wins, so the index of every
         # loaded file is only rebuilt when an addon is turned on or off.
@@ -1130,7 +1291,7 @@ class Organizer:
             return (("does nothing" if a.workshop_id else "custom/, does nothing")
                     + (" (only with %s)" % ac.plural(len(need), "other") if need else ""))
         if not a.workshop_id:
-            return "custom/ (always loaded)"
+            return "custom/ (loads first, A to Z)"
         if a in self.idle:
             e = self.idle[a]
             pct = 100 * ac.idle_count(e) // max(len(a.files), 1)
@@ -1199,9 +1360,9 @@ class Organizer:
         view = self.view.get()
         broken = self.broken_ids()
 
-        rows = [self.by_id[w] for w in self.listed_ids()]
+        custom = [a for a in self.addons if not a.workshop_id]  # load first, A to Z (see recompute)
+        rows = custom + [self.by_id[w] for w in self.listed_ids()]
         rows += sorted((a for a in self.addons if a.workshop_id and a.position is None), key=lambda a: a.name.lower())
-        rows += [a for a in self.addons if not a.workshop_id]
         rows = [a for a in rows if (not needle or needle in a.name.lower() or needle in (a.workshop_id or "")
                                     or needle in self.notes.get(self.addon_key(a), "").lower())
                 and self.in_view(a, view, broken)]
@@ -1233,8 +1394,9 @@ class Organizer:
             on = "" if a.position is None else ("☑" if a.rank is not None else "☐")
             key = self.addon_key(a)
             self.row_tags[key] = (fg, bg)
+            place = a.position or ("C%d" % (custom.index(a) + 1) if a in custom else "")
             self.tree.insert("", "end", iid=key, tags=[t for t in (fg, bg) if t], values=(
-                on, a.position or "", a.name, self.flags(a), self.types.get(a, ""), len(a.files),
+                on, place, a.name, self.flags(a), self.types.get(a, ""), len(a.files),
                 ac.nice_size(self.sizes.get(a, 0)), wins or "", loses or "", status,
                 self.notes.get(key, "")))
         for k in keep:
@@ -1404,12 +1566,14 @@ class Organizer:
         if plan == self.drag_plan:
             return
         self.drag_plan = plan
-        # Show where they'll land. The list shows the listed addons first, in load order.
+        # Show where they'll land. The listed addons are shown in load order, after the custom/ ones.
+        rows = self.tree.get_children()
+        first = next((n for n, k in enumerate(rows) if k in self.by_id), 0)
         moving = set(self.drag)
         self.tree.detach(*self.drag)
         for n, w in enumerate(plan):
             if w in moving:
-                self.tree.move(w, "", n)
+                self.tree.move(w, "", first + n)
 
     def on_drag_end(self, event):
         dragged, plan, self.drag, self.drag_plan = self.drag, self.drag_plan, None, None
@@ -2233,6 +2397,76 @@ class Organizer:
 
     # ------------------------------------------------------------------ help
 
+    # ------------------------------------------------------------------ installing custom/ addons
+
+    def install_target(self):
+        """The custom/ folder new addons go to: the first one the game loads (made if missing)."""
+        if not self.found_game:
+            messagebox.showerror("Install addon", "The Half-Life 2 folder wasn't found. Choose it in Folders... first.")
+            return None
+        return ac.mounted_custom_dirs(self.found_game, existing=False)[0]
+
+    def open_custom_folder(self):
+        target = self.install_target()
+        if target:
+            os.makedirs(target, exist_ok=True)
+            open_path(target)
+
+    def install_files(self):
+        if not self.install_target():
+            return
+        paths = filedialog.askopenfilenames(parent=self.root, title="Install addon",
+                                            filetypes=[("Addons", "*.vpk *.zip"), ("All files", "*.*")])
+        if paths:
+            self.install_paths(list(paths))
+
+    def install_folder(self):
+        if not self.install_target():
+            return
+        path = filedialog.askdirectory(parent=self.root, title="Install addon folder", mustexist=True)
+        if path:
+            self.install_paths([path])
+
+    def install_paths(self, paths):
+        """Installs dropped or chosen folders, VPKs and zips into custom/, then rescans."""
+        target = self.install_target()
+        if not target or not paths:
+            return
+        if self.scanning:
+            messagebox.showinfo("Install addon", "Wait for the scan to finish, then drop the addon again.")
+            return
+        installed, problems = [], []
+        work = tempfile.mkdtemp(prefix="addon_install_")
+        try:
+            for path in paths:
+                try:
+                    plan = plan_install(path, os.path.join(work, str(len(installed) + len(problems))))
+                except InstallError as e:
+                    problems.append(str(e))
+                    continue
+                for name, src in plan:
+                    dest = os.path.join(target, name)
+                    if os.path.normcase(os.path.abspath(src)) == os.path.normcase(os.path.abspath(dest)):
+                        problems.append("%s is already installed there" % name)
+                        continue
+                    if os.path.lexists(dest) and not messagebox.askyesno(
+                            "Install addon", "custom/%s is already there. Replace it?" % name):
+                        continue
+                    try:
+                        os.makedirs(target, exist_ok=True)
+                        copy_into(src, dest)
+                        installed.append(name)
+                    except OSError as e:
+                        problems.append("%s: %s" % (name, e.strerror or e))
+        finally:
+            shutil.rmtree(work, ignore_errors=True)
+        if problems:
+            messagebox.showwarning("Install addon", "\n".join(problems[:8]))
+        if installed:
+            self.status.config(text="Installed %s into %s." % (", ".join(installed[:3]) + (" and more" if len(
+                installed) > 3 else ""), target))
+            self.start_scan()
+
     def show_help(self):
         messagebox.showinfo("How it works", (
             "The list is your Workshop load order from workshop.txt. By default the addon higher in the "
@@ -2243,6 +2477,8 @@ class Organizer:
             "overwrite it red.\n\n"
             "Rules (Conflicts tab) say which addon should win; Sort by rules applies them with as little "
             "movement as possible.\n\n"
+            "custom/ addons (shown first, C1, C2...) load ahead of every Workshop addon, A to Z by folder name. "
+            "Install one with Install addon..., or on Windows by dropping it on the window.\n\n"
             "Changes only reach the game when you Save. Close the game first. Before the organizer replaces a "
             "workshop.txt it didn't write itself, it keeps a backup of it."))
 

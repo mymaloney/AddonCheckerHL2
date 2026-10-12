@@ -95,6 +95,19 @@ folder; tkinter comes with the python.org installer on Windows. Dark and light t
   winner just ahead of its loser, leaving everything else where it was.
 - **Notes:** a note per addon, shown in the Notes column and searchable with the filter.
 
+**`custom/` addons**
+
+- They're shown first, as **C1, C2…**, in the order the game loads them: ahead of the Workshop addons,
+  A to Z by folder name. Rename the folder to change its place.
+- **Install addon...** (toolbar and File menu) copies an addon into the game's `custom/` folder (the first
+  one `gameinfo.txt` lists, usually `hl2_complete/custom`). On Windows you can also **drop** files and
+  folders from Explorer onto the window. It takes:
+  - a folder (an extra wrapper folder, like `HD Crowbar/HD Crowbar/materials`, is skipped),
+  - a `.vpk` (a `foo_dir.vpk` comes with its `foo_000.vpk`… parts),
+  - a `.zip`, which is unpacked; one with only VPKs puts them straight into `custom/`.
+  `.7z` and `.rar` need unpacking first. An addon that's already there is only replaced after you say so,
+  and the organizer rescans afterwards.
+
 **Toolbar and menus**
 
 - **Save load order** (Ctrl+S) writes `workshop.txt` after backing up the old one as
@@ -152,7 +165,9 @@ The game keeps your Workshop addons' load order in
   If the game turns out to work the other way, use `--last-wins`.
   To check: find a conflict in the report where you can tell the addons apart in game
   (a map or a weapon model), see which one you get, and compare their `#N`.
-- `custom/` addons aren't in the list, so conflicts involving them show no winner.
+- `custom/` addons load ahead of every Workshop addon, A to Z by folder name (custom folder by custom
+  folder, in `gameinfo.txt`'s order). So with the assumption above a `custom/` addon beats any Workshop
+  addon, and `--last-wins` flips that too.
 
 ## Tests
 

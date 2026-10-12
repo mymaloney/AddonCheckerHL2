@@ -656,10 +656,11 @@ def gameinfo_vpks(game_dir):
 FALLBACK_CUSTOM_FOLDERS = ["hl2_complete", "ep2", "episodic", "hl2"]
 
 
-def mounted_custom_dirs(game_dir):
-    """The custom/ folders the game loads addons from: gameinfo.txt's "custom/*" entries.
-    Other games that share the Half-Life 2 folder (Lost Coast, Half-Life: Source) have their
-    own custom/ folders, which Half-Life 2 never loads."""
+def mounted_custom_dirs(game_dir, existing=True):
+    """The custom/ folders the game loads addons from: gameinfo.txt's "custom/*" entries, in
+    the game's order. Other games that share the Half-Life 2 folder (Lost Coast, Half-Life:
+    Source) have their own custom/ folders, which Half-Life 2 never loads.
+    existing=False also returns folders that don't exist yet (to install into)."""
     paths, gameinfo = gameinfo_search_paths(game_dir)
     if gameinfo:
         dirs = []
@@ -670,7 +671,7 @@ def mounted_custom_dirs(game_dir):
                     dirs.append(folder)
     else:
         dirs = [os.path.join(game_dir, sub, "custom") for sub in FALLBACK_CUSTOM_FOLDERS]
-    return [d for d in dirs if os.path.isdir(d)]
+    return [d for d in dirs if os.path.isdir(d)] if existing else dirs
 
 
 def fallback_vpks(game_dir):
@@ -918,6 +919,17 @@ def find_install(game_dir=None):
 # ---------------------------------------------------------------------------
 # Analysis + report
 # ---------------------------------------------------------------------------
+
+def rank_custom_addons(addons, last_wins=False):
+    """The game loads custom/ addons ahead of every Workshop addon, A to Z by folder name. The
+    scan already lists them in that order (custom/ folder by custom/ folder, in gameinfo.txt's
+    order), so their ranks come before the Workshop ranks (0, 1, 2... from workshop.txt), or
+    after them when the lower addon in the list wins. Returns them in load order."""
+    custom = [a for a in addons if not a.workshop_id and not a.stray and not a.leftover]
+    for n, a in enumerate(custom):
+        a.rank = len(custom) - n if last_wins else n - len(custom)
+    return custom
+
 
 def known(*addons):
     return all(a.rank is not None for a in addons)
@@ -1285,7 +1297,8 @@ def format_report(addons, skipped, containers, load_order, analysis, limit, base
         w("Load order: " + load_order)
         w("  [#N] = position in that list. " + LOAD_ORDER_NOTE)
     else:
-        w("Load order: not found, so the report can't say which addon wins a conflict.")
+        w("Load order: workshop.txt not found, so the report can't say which Workshop addon wins a conflict.")
+    w("custom/ addons load ahead of Workshop addons, A to Z by folder name.")
     w("Base game: " + (base_info or "not checked"))
     w("")
 
@@ -1575,6 +1588,7 @@ def main():
     stray = [a for a in addons if a.stray and not a.leftover]
     addons = [a for a in addons if not a.leftover and not a.stray]
 
+    rank_custom_addons(addons, args.last_wins)
     disabled, unlisted = [], []
     loaded = None  # with --all: the addons the game really loads
     if load_order:
@@ -1593,7 +1607,7 @@ def main():
         active = []
         for a in addons:
             if not a.workshop_id:
-                active.append(a)  # custom/ addons: always loaded, order unknown
+                active.append(a)  # custom/ addons: always loaded, ahead of the Workshop ones
                 continue
             if a.workshop_id not in info:
                 unlisted.append(a)
