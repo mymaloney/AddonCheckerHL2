@@ -16,7 +16,9 @@ import heapq
 import json
 import os
 import queue
+import re
 import shutil
+import stat
 import subprocess
 import sys
 import threading
@@ -99,6 +101,68 @@ def stable_toposort(ids, edges, from_end=False):
             if not incoming[b]:
                 heapq.heappush(ready, index[b])
     return out[::-1] if from_end else out
+
+
+def edges_in_cycles(edges):
+    """The (a, b) edges that are part of a cycle, i.e. a can be reached again from b."""
+    after = defaultdict(set)
+    for a, b in edges:
+        after[a].add(b)
+
+    def reaches(start, goal):
+        seen, todo = set(), [start]
+        while todo:
+            w = todo.pop()
+            if w == goal:
+                return True
+            if w not in seen:
+                seen.add(w)
+                todo.extend(after[w])
+        return False
+    return {(a, b) for a, b in edges if reaches(b, a)}
+
+
+def without_repeats(entries):
+    """[[id, enabled]] with each id once. The last entry for an id is the one that counts,
+    as in addon_checker.py, so that's the one kept."""
+    seen, out = set(), []
+    for e in reversed(entries):
+        if e[0] not in seen:
+            seen.add(e[0])
+            out.append(e)
+    return out[::-1]
+
+
+def unique_path(stem, ext):
+    """stem + ext, or stem-2 + ext, stem-3 + ext... whichever doesn't exist yet."""
+    path, n = stem + ext, 1
+    while os.path.exists(path):
+        n += 1
+        path = "%s-%d%s" % (stem, n, ext)
+    return path
+
+
+def is_link(path):
+    """Symlinks, and Windows junctions, which os.path.islink only reports from Python 3.12 on."""
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return True  # can't tell, so treat it as something to keep
+    return stat.S_ISLNK(st.st_mode) or bool(getattr(st, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT)
+
+
+def only_cache_files(folder):
+    """True if folder holds nothing but cache files and empty folders. A link counts as content, and a
+    subfolder that can't be read makes it False, so deleting the folder can never remove real files."""
+    if is_link(folder):
+        return False
+    errors = []
+    for dirpath, dirs, names in os.walk(folder, onerror=errors.append):
+        if any(is_link(os.path.join(dirpath, n)) for n in dirs + names):
+            return False
+        if not all(ac.is_cache(n) for n in names):
+            return False
+    return not errors
 
 
 def addon_type(addon):
@@ -200,14 +264,22 @@ class Organizer:
         self.selected = None      # Addon shown on the right
         self.selected_rel = {}
         self.row_tags = {}        # tree row -> (foreground tag, background tag)
-        self.backup_done = False
+        self.disk_entries = None  # workshop.txt as last read or written here: [(id, enabled)]
+        self.disk_ours = False    # whether that version was written here (then saving needs no backup)
         self.scanning = False
+        self.rescan_pending = False  # Rescan or new folders while a scan runs: scan again when it ends
         self.removable = set()
         self.idle = {}
         self.by_path = {}
+        self.indexed = None       # the set of active addons by_path was built from
+        self.conflict_paths = []  # [(path, copies)] with more than one version of the file
         self.stats = {}
-        self.drag = None
-        self.drag_moved = False
+        self.recompute_due = False
+        self.list_rebuilt, self.settle_job = False, None  # see the end of refresh_list
+        self.note_key = None      # addon whose note is in the Notes box
+        self.drag = None          # ids being dragged, in load order
+        self.drag_row = None      # the row the drag started on
+        self.drag_plan = None     # the listed ids as they'd be if dropped now
 
         # The scan runs in a background thread; it hands window updates to the main thread
         # through this queue instead of touching tkinter itself.
@@ -226,35 +298,77 @@ class Organizer:
         self.view.trace_add("write", lambda *_: self.refresh_list())
         self.last_wins.trace_add("write", lambda *_: self.on_direction_changed())
         root.protocol("WM_DELETE_WINDOW", self.on_close)
+        if self.settings_problem:
+            messagebox.showwarning("Settings", self.settings_problem)
         self.start_scan()
 
     # ------------------------------------------------------------------ settings
 
     def load_settings(self):
+        self.settings_problem = None     # told to the user once the window is up
+        self.keep_settings_file = False  # the file couldn't be read: never overwrite it
+        name = os.path.basename(SETTINGS_FILE)
+        data = {}
         try:
-            with open(SETTINGS_FILE, encoding="utf-8") as f:
+            with open(SETTINGS_FILE, encoding="utf-8-sig") as f:  # -sig: Notepad may have added a BOM
                 data = json.load(f)
-        except (OSError, ValueError):
+            if not isinstance(data, dict):
+                raise ValueError("it doesn't hold a { ... } block")
+        except FileNotFoundError:
+            pass
+        except (OSError, ValueError) as e:
             data = {}
+            problem = ("%s couldn't be read (%s), so the organizer starts without its rules, notes and profiles.\n\n"
+                       % (name, e))
+            kept = None
+            if isinstance(e, ValueError):  # damaged (a hand edit, or a write cut short): set it aside
+                kept = unique_path(SETTINGS_FILE, ".broken")
+                try:
+                    os.replace(SETTINGS_FILE, kept)
+                except OSError:
+                    kept = None
+            if kept:
+                problem += ("The file was kept as %s. Fix it in a text editor and rename it back to %s to get "
+                            "them back." % (os.path.basename(kept), name))
+            else:
+                self.keep_settings_file = True
+                problem += "Changes to them won't be saved this time, so the file is left as it is."
+            self.settings_problem = problem
+
+        def get(key, kind, default):
+            value = data.get(key, default)
+            return value if isinstance(value, kind) else default
+
         self.settings = data
-        self.rules = [r for r in data.get("rules", []) if r.get("winner") and r.get("loser")]
+        self.rules = [dict(r, winner=str(r["winner"]), loser=str(r["loser"])) for r in get("rules", list, [])
+                      if isinstance(r, dict) and isinstance(r.get("winner"), (str, int))
+                      and isinstance(r.get("loser"), (str, int)) and r["winner"] and r["loser"]]
         self.last_wins.set(bool(data.get("last_wins", False)))
-        self.game_dir = data.get("game_dir") or None
-        self.workshop_dir = data.get("workshop_dir") or None
-        self.notes = dict(data.get("notes", {}))
-        self.profiles = dict(data.get("profiles", {}))
-        self.theme_name.set(data.get("theme", "dark") if data.get("theme") in THEMES else "dark")
-        self.hidden_columns = list(data.get("hidden_columns", DEFAULT_HIDDEN))
+        self.game_dir = get("game_dir", str, "") or None
+        self.workshop_dir = get("workshop_dir", str, "") or None
+        self.notes = {k: v for k, v in get("notes", dict, {}).items() if isinstance(v, str)}
+        self.profiles = {}
+        for profile, entries in get("profiles", dict, {}).items():
+            if isinstance(entries, list):
+                entries = [e for e in entries if isinstance(e, list) and len(e) == 2 and isinstance(e[0], (str, int))]
+                self.profiles[profile] = without_repeats([[str(w), bool(on)] for w, on in entries])
+        self.theme_name.set(get("theme", str, "dark") if get("theme", str, "") in THEMES else "dark")
+        self.hidden_columns = [c for c in get("hidden_columns", list, DEFAULT_HIDDEN) if isinstance(c, str)]
 
     def save_settings(self):
+        if self.keep_settings_file:
+            return
         self.settings.update({
             "game_dir": self.game_dir, "workshop_dir": self.workshop_dir, "last_wins": self.last_wins.get(),
             "theme": self.theme_name.get(), "hidden_columns": self.hidden_columns,
             "rules": self.rules, "notes": self.notes, "profiles": self.profiles,
         })
+        # Through a temp file, so a write that's cut short (disk full, crash) can't damage the old one.
+        tmp = SETTINGS_FILE + ".tmp"
         try:
-            with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
+            with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(self.settings, f, indent=2)
+            os.replace(tmp, SETTINGS_FILE)
         except OSError as e:
             messagebox.showerror("Couldn't save settings", "%s\n%s" % (SETTINGS_FILE, e))
 
@@ -467,8 +581,8 @@ class Organizer:
         self.problems_btn.pack(side="right", padx=(0, self.px(10)))
 
         theme = self.theme_name.get
-        Tooltip(self.save_btn, "Write the load order to the game's workshop.txt (a backup is made first). "
-                               "Close the game before saving.", theme)
+        Tooltip(self.save_btn, "Write the load order to the game's workshop.txt (the game's version is backed up "
+                               "first). Close the game before saving.", theme)
         Tooltip(sort_btn, "Reorder so every rule is met, moving each rule's winner just ahead of its loser.", theme)
         Tooltip(clean_btn, "Move every addon that does nothing to the end of the list where it loses. "
                            "The game plays the same, and they end up together for unsubscribing.", theme)
@@ -509,7 +623,7 @@ class Organizer:
         self.tree.bind("<B1-Motion>", self.on_drag_motion)
         self.tree.bind("<ButtonRelease-1>", self.on_drag_end)
         self.tree.bind("<Double-1>", self.on_double_click)
-        self.tree.bind("<space>", lambda e: self.toggle_enabled())
+        self.tree.bind("<space>", lambda e: self.toggle_enabled(soon=True))
         self.tree.bind("<Button-3>", self.show_context_menu)
         if sys.platform == "darwin":
             self.tree.bind("<Button-2>", self.show_context_menu)
@@ -654,8 +768,29 @@ class Organizer:
             item = cv.create_text(x, y, text=text, anchor="w", fill=c["muted"], font=self.font_small)
             x = cv.bbox(item)[2] + self.px(14)
 
+    def screen_area(self):
+        """(x, y, width, height) of the desktop: every monitor on Windows, the (virtual) screen elsewhere."""
+        if sys.platform == "win32":
+            try:
+                from ctypes import windll
+                metric = windll.user32.GetSystemMetrics
+                if metric(78) and metric(79):  # SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN
+                    return metric(76), metric(77), metric(78), metric(79)
+            except Exception:
+                pass
+        r = self.root
+        return (0, 0, max(r.winfo_screenwidth(), r.winfo_vrootwidth()),
+                max(r.winfo_screenheight(), r.winfo_vrootheight()))
+
     def restore_layout(self):
         geometry = self.settings.get("geometry")
+        m = re.match(r"(\d+)x(\d+)\+(-?\d+)\+(-?\d+)$", geometry) if isinstance(geometry, str) else None
+        if m:
+            # Last closed on a monitor that isn't there now: keep the size, let the system place it.
+            w, h, x, y = (int(n) for n in m.groups())
+            ax, ay, aw, ah = self.screen_area()
+            if not (ax - w + 100 <= x <= ax + aw - 100 and ay - 50 <= y <= ay + ah - 100):
+                geometry = "%dx%d" % (w, h)
         if geometry:
             try:
                 self.root.geometry(geometry)
@@ -675,6 +810,8 @@ class Organizer:
             self.root.after(100, self.restore_sash)
             return
         frac = self.settings.get("sash", 0.58)
+        if not isinstance(frac, (int, float)):
+            frac = 0.58
         pos = int(width * min(max(frac, 0.3), 0.8))
         try:
             self.panes.sashpos(0, pos)
@@ -684,15 +821,22 @@ class Organizer:
     def bind_keys(self):
         r = self.root
         r.bind_all("<Control-s>", lambda e: self.save_order())
-        r.bind_all("<Control-z>", lambda e: self.undo())
-        r.bind_all("<Control-y>", lambda e: self.redo())
-        r.bind_all("<Control-Shift-Z>", lambda e: self.redo())
+        # In a text box (Notes, Filter, Find...) these are for the text, not the load order.
+        r.bind_all("<Control-z>", lambda e: None if self.in_text_box(e) else self.undo(soon=True))
+        r.bind_all("<Control-y>", lambda e: None if self.in_text_box(e) else self.redo(soon=True))
+        r.bind_all("<Control-Shift-Z>", lambda e: None if self.in_text_box(e) else self.redo(soon=True))
         r.bind_all("<Control-f>", lambda e: self.focus_filter())
         r.bind_all("<F5>", lambda e: self.start_scan())
-        self.tree.bind("<Control-Up>", lambda e: self.move_selected(-1) or "break")
-        self.tree.bind("<Control-Down>", lambda e: self.move_selected(1) or "break")
-        self.tree.bind("<Control-Home>", lambda e: self.move_selected("top") or "break")
-        self.tree.bind("<Control-End>", lambda e: self.move_selected("bottom") or "break")
+        # Held down, these repeat faster than the list can be rebuilt (see recompute_soon).
+        for key, where in (("Up", -1), ("Down", 1), ("Home", "top"), ("End", "bottom")):
+            self.tree.bind("<Control-%s>" % key, lambda e, w=where: self.move_selected(w, soon=True) or "break")
+
+    def in_text_box(self, event):
+        try:
+            kind = self.root.tk.call("winfo", "class", str(event.widget))
+        except tk.TclError:
+            return False
+        return kind in ("Entry", "TEntry", "TCombobox", "Spinbox", "TSpinbox", "Text")
 
     def center(self, win):
         """Put a dialog in the middle of the main window."""
@@ -722,22 +866,39 @@ class Organizer:
 
     def start_scan(self, confirm=True):
         if self.scanning:
+            # The folders may have changed (Folders... OK): scan again as soon as this scan ends.
+            self.rescan_pending = True
+            self.status.config(text="A scan is running. It will start over when it's done...")
             return
         if confirm and self.is_dirty() and not messagebox.askyesno(
                 "Rescan", "Rescanning discards your unsaved load order changes. Continue?"):
             return
+        self.save_note()
         self.scanning = True
+        self.recompute_due = False
         self.status.config(text="Finding Half-Life 2...")
+        # Forget the rows before deleting them, so the selection change this causes doesn't look them up.
+        self.row_tags, self.selected, self.selected_rel = {}, None, {}
         self.tree.delete(*self.tree.get_children())
         threading.Thread(target=self.scan_thread, daemon=True).start()
 
     def poll_ui(self):
         try:
             while True:
-                self.ui_queue.get_nowait()()
+                fn = self.ui_queue.get_nowait()
+                try:
+                    fn()
+                except Exception as e:
+                    # Report it and carry on: if this loop stopped, no scan would ever show again.
+                    self.scanning = self.rescan_pending = False
+                    self.root.report_callback_exception(*sys.exc_info())
+                    self.status.config(text="Something went wrong: %s" % e)
+                    messagebox.showerror("Something went wrong", "%s\n\nThe list may be incomplete. Rescan (F5) to "
+                                         "try again." % (str(e) or type(e).__name__))
         except queue.Empty:
             pass
-        self.root.after(100, self.poll_ui)
+        finally:
+            self.root.after(100, self.poll_ui)
 
     def ui(self, fn):
         """Run fn on the main thread (for use from the scan thread)."""
@@ -783,13 +944,26 @@ class Organizer:
         except Exception as e:  # report anything unexpected instead of dying silently
             message = str(e)
             self.set_status("Scan failed: " + message)
-            self.ui(lambda: setattr(self, "scanning", False))
-            self.ui(lambda: messagebox.showerror("Scan failed", message))
+            self.ui(lambda: self.scan_failed(message))
             return
         self.ui(lambda: self.scan_done(game, workshop, containers, addons, path, entries, base, base_info))
 
-    def scan_done(self, game, workshop, containers, addons, path, entries, base=None, base_info=""):
+    def rescan_if_pending(self):
+        """After a scan: if Rescan was asked for (or new folders chosen) meanwhile, its results are stale."""
         self.scanning = False
+        if not self.rescan_pending:
+            return False
+        self.rescan_pending = False
+        self.start_scan(confirm=False)
+        return True
+
+    def scan_failed(self, message):
+        if not self.rescan_if_pending():
+            messagebox.showerror("Scan failed", message)
+
+    def scan_done(self, game, workshop, containers, addons, path, entries, base=None, base_info=""):
+        if self.rescan_if_pending():
+            return
         self.base, self.base_info = base or {}, base_info
         self.found_game, self.found_workshop = game, workshop
         self.containers = containers
@@ -808,13 +982,22 @@ class Organizer:
         self.types = {a: addon_type(a) for a in self.addons}
         self.sizes = {a: addon_size(a) for a in self.addons}
         self.load_order_path = path
-        self.order = [[wsid, enabled] for wsid, enabled in entries]
+        # An id listed twice (a hand edit) would show up twice; keep the entry that counts.
+        self.order = without_repeats([[wsid, enabled] for wsid, enabled in entries])
+        repeated = sorted({w for w, n in Counter(w for w, _ in entries).items() if n > 1})
         self.saved_order = [list(e) for e in self.order]
+        self.disk_entries, self.disk_ours = [(w, bool(e)) for w, e in entries], False
         self.history, self.future = [], []
-        self.backup_done = False
         self.selected = None
         self.root.title("HL2 Addon Organizer - %s" % (game or workshop or "no folders"))
         self.recompute()
+        if repeated:
+            names = [self.by_id[w].name if w in self.by_id else "Workshop item %s" % w for w in repeated]
+            messagebox.showwarning(
+                "Addons listed twice",
+                "workshop.txt lists %s more than once:\n\n%s\n\nThe organizer uses the last line for each one, "
+                "and saving the load order writes each addon once."
+                % (ac.plural(len(repeated), "addon"), "\n".join(names[:10]) + ("\n..." if len(names) > 10 else "")))
         self.check_load_order_matches()
 
     def check_load_order_matches(self):
@@ -837,7 +1020,26 @@ class Organizer:
     def listed_ids(self):
         return [wsid for wsid, _ in self.order if wsid in self.by_id]
 
+    def recompute_soon(self):
+        """
+        Held keys and quick clicks change the order faster than the list can be rebuilt, so they
+        only change self.order, and this rebuilds once when they've all been handled. Until then the
+        rows stay as the user saw them, so a click that was waiting still lands on its row.
+        """
+        if not self.recompute_due:
+            self.recompute_due = True
+            self.root.after_idle(self.recompute_if_due)
+
+    def recompute_if_due(self):
+        if self.recompute_due:
+            self.recompute()
+            sel = self.tree.selection()
+            if sel:
+                self.tree.see(sel[0])
+
     def recompute(self):
+        self.recompute_due = False
+        self.save_note()  # before refresh_details refills the Notes box
         enabled = {wsid: en for wsid, en in self.order}
         positions = {wsid: n for n, (wsid, _) in enumerate(self.order)}
         last_wins = self.last_wins.get()
@@ -854,14 +1056,20 @@ class Organizer:
                 a.rank = -n if last_wins else n
             active.append(a)
 
-        self.by_path = ac.index_files(active)
+        # Moving an addon doesn't change which files are loaded, only who wins, so the index of every
+        # loaded file is only rebuilt when an addon is turned on or off.
+        if self.indexed != frozenset(active):
+            self.by_path = ac.index_files(active)
+            self.conflict_paths = [(path, copies) for path, copies in self.by_path.items()
+                                   if len(copies) > 1 and len({(s, c) for _, s, c in copies}) > 1]
+            self.indexed = frozenset(active)
         self.removable, idle = ac.find_idle_addons(active, self.by_path, self.base)
         self.idle = {e[0]: e for e in idle}
 
         # Per addon: files where it beats / loses to a different copy.
         self.stats = defaultdict(lambda: [0, 0])
-        for path, copies in self.by_path.items():
-            if len({(s, c) for _, s, c in copies}) < 2 or not ac.known(*(c[0] for c in copies)):
+        for path, copies in self.conflict_paths:
+            if not ac.known(*(c[0] for c in copies)):
                 continue
             ranked = ac.by_rank(copies)
             winner = ranked[0]
@@ -877,7 +1085,7 @@ class Organizer:
         self.refresh_rules()
         self.refresh_status()
         if self.find_text.get().strip():
-            self.run_find()  # the order changed, so which copy is used may have too
+            self.run_find(select_tab=False)  # the order changed, so which copy is used may have too
 
     def rule_broken(self, rule):
         a, b = self.by_id.get(rule["winner"]), self.by_id.get(rule["loser"])
@@ -949,10 +1157,12 @@ class Organizer:
 
     def reset_view(self):
         if not self.is_plain_view():
+            # Sort first: the two lines after it refresh the list, which must come out in load order.
+            self.sort = ("pos", False)
             self.filter_text.set("")
             self.view.set(VIEWS[0])
-            self.sort = ("pos", False)
             self.update_headings()
+            self.refresh_list()  # even if the caller then changes nothing
 
     def sort_by_column(self, col):
         if col in ("on", "flags"):
@@ -1029,6 +1239,15 @@ class Organizer:
                                if len(rows) != len(self.addons) else "Load order   %d addons, %d listed"
                                % (len(self.addons), total))
         self.highlight_relations()
+        # Clicks that arrived while this ran were aimed at the old rows; on_drag_start skips them.
+        # Idle callbacks only run once those are handled.
+        if self.settle_job:
+            self.root.after_cancel(self.settle_job)
+        self.list_rebuilt = True
+        self.settle_job = self.root.after_idle(self.list_settled)
+
+    def list_settled(self):
+        self.list_rebuilt, self.settle_job = False, None
 
     def highlight_relations(self):
         """Mod Organizer style: colour the addons the selected one overwrites, or is overwritten by."""
@@ -1049,8 +1268,9 @@ class Organizer:
     def is_dirty(self):
         return self.order != self.saved_order
 
-    def set_order(self, new_order, remember=True):
-        """Every load order change goes through here, so it can be undone."""
+    def set_order(self, new_order, remember=True, soon=False):
+        """Every load order change goes through here, so it can be undone.
+        soon: for keys and clicks, which can come quickly; see recompute_soon."""
         if new_order == self.order:
             return
         if remember:
@@ -1058,9 +1278,12 @@ class Organizer:
             del self.history[:-200]
             self.future = []
         self.order = [list(e) for e in new_order]
-        self.recompute()
+        if soon:
+            self.recompute_soon()
+        else:
+            self.recompute()
 
-    def apply_order(self, ids_in_order):
+    def apply_order(self, ids_in_order, soon=False):
         """ids_in_order: the installed, listed ids in their new order. Uninstalled ids keep their slots."""
         it = iter(ids_in_order)
         enabled = {w: e for w, e in self.order}
@@ -1070,23 +1293,23 @@ class Organizer:
                 w = next(it)
                 e = enabled[w]
             new.append([w, e])
-        self.set_order(new)
+        self.set_order(new, soon=soon)
 
-    def undo(self):
+    def undo(self, soon=False):
         if not self.history:
             self.status.config(text="Nothing to undo.")
             return
         self.future.append([list(e) for e in self.order])
-        self.set_order(self.history.pop(), remember=False)
+        self.set_order(self.history.pop(), remember=False, soon=soon)
 
-    def redo(self):
+    def redo(self, soon=False):
         if not self.future:
             self.status.config(text="Nothing to redo.")
             return
         self.history.append([list(e) for e in self.order])
-        self.set_order(self.future.pop(), remember=False)
+        self.set_order(self.future.pop(), remember=False, soon=soon)
 
-    def move_selected(self, where):
+    def move_selected(self, where, soon=False):
         sel = self.movable_selection()
         self.reset_view()  # moving within a filtered or sorted view would be confusing
         if not sel:
@@ -1109,16 +1332,16 @@ class Organizer:
                 for i in reversed(idx):
                     if i < len(new) - 1 and new[i + 1] not in chosen:
                         new[i + 1], new[i] = new[i], new[i + 1]
-        self.apply_order(new)
+        self.apply_order(new, soon=soon)
         self.tree.selection_set(chosen)
         self.tree.see(chosen[0])
 
-    def toggle_enabled(self, keys=None):
+    def toggle_enabled(self, keys=None, soon=False):
         sel = keys or self.movable_selection()
         if not sel:
             return "break"
         turn_on = not all(e for w, e in self.order if w in sel)
-        self.set_order([[w, turn_on if w in sel else e] for w, e in self.order])
+        self.set_order([[w, turn_on if w in sel else e] for w, e in self.order], soon=soon)
         return "break"
 
     def column_at(self, x):
@@ -1132,33 +1355,63 @@ class Organizer:
         return shown[index] if 0 <= index < len(shown) else None
 
     def on_drag_start(self, event):
+        self.drag = self.drag_plan = None
+        if self.list_rebuilt:
+            return "break"  # pressed while the list was being rebuilt: the row under it has changed
         row = self.tree.identify_row(event.y)
-        self.drag_moved = False
-        self.drag = None
         if not row or row not in self.by_id or self.by_id[row].position is None:
             return
         if self.column_at(event.x) == "on":
-            self.toggle_enabled([row])
-            self.tree.selection_set(row)
+            self.toggle_enabled([row], soon=True)
+            if self.tree.exists(row):
+                self.tree.selection_set(row)
             return "break"
-        self.drag = row
+        self.drag_row = row
+        sel = self.movable_selection()
+        modifiers = 0x0001 | 0x0004 | (0x0008 if sys.platform == "darwin" else 0)  # Shift, Control, Command
+        if row in sel and len(sel) > 1 and not event.state & modifiers:
+            # Pressed on one of several selected rows: drag them all, so keep the selection.
+            self.drag = [w for w in self.listed_ids() if w in sel]
+            self.tree.focus_set()
+            self.tree.focus(row)
+            return "break"
+        self.drag = [row]
+
+    def dragged_order(self, order, target):
+        """order with the dragged ids taken out and put back at target: below it if it's below them,
+        above it otherwise."""
+        moving = set(self.drag)
+        rest = [w for w in order if w not in moving]
+        at = rest.index(target) + (1 if order.index(target) > order.index(self.drag[0]) else 0)
+        return rest[:at] + self.drag + rest[at:]
 
     def on_drag_motion(self, event):
         if not self.drag or not self.is_plain_view():
             return
         target = self.tree.identify_row(event.y)
-        if target and target != self.drag and target in self.by_id and self.by_id[target].position is not None:
-            self.tree.move(self.drag, "", self.tree.index(target))
-            self.drag_moved = True
+        if not target or target in self.drag or target not in self.by_id or self.by_id[target].position is None:
+            return
+        # Worked out from the load order itself, never from what the list shows.
+        plan = self.dragged_order(self.drag_plan or self.listed_ids(), target)
+        if plan == self.drag_plan:
+            return
+        self.drag_plan = plan
+        # Show where they'll land. The list shows the listed addons first, in load order.
+        moving = set(self.drag)
+        self.tree.detach(*self.drag)
+        for n, w in enumerate(plan):
+            if w in moving:
+                self.tree.move(w, "", n)
 
     def on_drag_end(self, event):
-        if self.drag and self.drag_moved:
-            new = [k for k in self.tree.get_children() if k in self.by_id and self.by_id[k].position is not None]
-            dragged = self.drag
-            self.drag = None
-            self.apply_order(new)
+        dragged, plan, self.drag, self.drag_plan = self.drag, self.drag_plan, None, None
+        if not dragged:
+            return
+        if plan and sorted(plan) == sorted(self.listed_ids()):
+            self.apply_order(plan)
             self.tree.selection_set(dragged)
-        self.drag = None
+        elif len(dragged) > 1:
+            self.tree.selection_set(self.drag_row)  # a click without a drag selects just that row
 
     def on_double_click(self, event):
         if self.column_at(event.x) == "on":
@@ -1173,27 +1426,32 @@ class Organizer:
         """
         ids = self.listed_ids()
         last_wins = self.last_wins.get()
-        edges = []  # (earlier, later) in list order
+        edges = []  # [((earlier, later) in list order, rule)]
         for r in self.rules:
             w, l = r["winner"], r["loser"]
             if w in self.by_id and l in self.by_id and w in ids and l in ids:
-                edges.append((l, w) if last_wins else (w, l))
+                edges.append(((l, w) if last_wins else (w, l), r))
+        # Rules that go in a circle can't all be met: leave those out and apply the rest.
+        circle = edges_in_cycles([e for e, _ in edges])
+        skipped = [r for e, r in edges if e in circle]
         # Building the list from the end pulls "earlier" items up (the winner when
         # higher wins); building from the start pushes "later" items down (the
         # winner when lower wins).
-        new = stable_toposort(ids, edges, from_end=not last_wins)
-        if len(new) < len(ids):
-            stuck = [self.by_id[w].name for w in ids if w not in new]
+        new = stable_toposort(ids, [e for e, _ in edges if e not in circle], from_end=not last_wins)
+        if new != ids:
+            self.reset_view()
+            self.apply_order(new)
+            self.status.config(text="Sorted by rules. Not saved yet.")
+        if skipped:
+            lines = ["%s should win over %s" % (self.by_id[r["winner"]].name, self.by_id[r["loser"]].name)
+                     for r in skipped]
             messagebox.showerror("Rules contradict each other",
-                                 "These addons have rules that go in a circle, so no order satisfies them all:\n\n"
-                                 + "\n".join(stuck[:15]) + "\n\nDelete one of the rules in the Rules tab.")
-            return
-        if new == ids:
+                                 "These rules go in a circle, so no order meets them all:\n\n"
+                                 + "\n".join(lines[:15]) + ("\n..." if len(lines) > 15 else "")
+                                 + ("\n\nThe other rules were applied." if new != ids else "")
+                                 + "\n\nDelete one of these rules in the Rules tab.")
+        elif new == ids:
             messagebox.showinfo("Sort by rules", "The load order already follows every rule.")
-            return
-        self.reset_view()
-        self.apply_order(new)
-        self.status.config(text="Sorted by rules. Not saved yet.")
 
     def move_removable(self):
         ids = self.listed_ids()
@@ -1468,10 +1726,19 @@ class Organizer:
             out.append(("info", "%s do nothing" % ac.plural(len(self.removable), "addon"),
                         "Every file is overwritten or identical elsewhere. You can unsubscribe from them.",
                         "Move them down", self.move_removable))
-        if self.leftovers:
-            out.append(("info", "%s from removed addons" % ac.plural(len(self.leftovers), "leftover folder"),
+        workshop_leftovers = self.workshop_leftovers()
+        if workshop_leftovers:
+            out.append(("info", "%s from removed addons" % ac.plural(len(workshop_leftovers),
+                                                                     "leftover Workshop folder"),
                         "These Workshop folders only hold cache files the game left behind.",
                         "Delete them", self.delete_leftovers))
+        empty = [a for a in self.leftovers if a not in workshop_leftovers]
+        if empty:
+            out.append(("info", "%s with no addon files" % ac.plural(len(empty), "folder"),
+                        "%s%s. They're empty or only hold cache files, so the game gets nothing from them. "
+                        "They're left alone here: maybe you're still making that addon."
+                        % (", ".join(a.name for a in empty[:3]), " and more" if len(empty) > 3 else ""),
+                        None, None))
         if self.base_info.startswith(("no original", "original game files not")):
             out.append(("warn", "Original game files weren't compared", self.base_info, "Folders...",
                         self.choose_folders))
@@ -1511,16 +1778,18 @@ class Organizer:
         win.bind("<Escape>", lambda e: win.destroy())
         self.center(win)
 
+    def workshop_leftovers(self):
+        """Leftover folders of removed Workshop items. Only these can be deleted here: an empty
+        custom/ folder may be an addon someone is still making."""
+        if not self.found_workshop:
+            return []
+        workshop = os.path.normcase(os.path.abspath(self.found_workshop))
+        return [a for a in self.leftovers if a.workshop_id
+                and os.path.normcase(os.path.dirname(os.path.abspath(a.location))) == workshop]
+
     def delete_leftovers(self):
         # Only folders that still hold nothing but cache files.
-        doomed = []
-        for a in self.leftovers:
-            try:
-                names = [n for _, _, files in os.walk(a.location) for n in files]
-            except OSError:
-                continue
-            if all(ac.is_cache(n) for n in names):
-                doomed.append(a)
+        doomed = [a for a in self.workshop_leftovers() if only_cache_files(a.location)]
         if not doomed:
             messagebox.showinfo("Leftover folders", "Nothing to delete.")
             return
@@ -1532,10 +1801,14 @@ class Organizer:
             return
         failed = []
         for a in doomed:
+            # Again right before deleting: Steam or the game may have put something there meanwhile.
+            if not only_cache_files(a.location):
+                failed.append("%s: it isn't only cache files now" % a.location)
+                continue
             try:
                 shutil.rmtree(a.location)
             except OSError as e:
-                failed.append("%s: %s" % (a.location, e.strerror))
+                failed.append("%s: %s" % (a.location, e.strerror or e))
         self.leftovers = [a for a in self.leftovers if a not in doomed or os.path.exists(a.location)]
         self.refresh_status()
         if failed:
@@ -1552,23 +1825,48 @@ class Organizer:
         if not self.is_dirty():
             self.status.config(text="No changes to save.")
             return
-        if not messagebox.askokcancel(
+        path = self.load_order_path
+        # The game rewrites workshop.txt when addons are turned on or off or subscribed to in game.
+        try:
+            on_disk = [(w, bool(e)) for w, e in ac.read_load_order(path)]
+        except OSError:
+            on_disk = None
+        changed = on_disk != self.disk_entries
+        if changed:
+            answer = messagebox.askyesnocancel(
+                "workshop.txt has changed",
+                "workshop.txt was changed after the organizer read it, probably by the game. Saving now would "
+                "undo those changes.\n\n"
+                "Yes: rescan to load the new version (your unsaved changes here are lost).\n"
+                "No: save anyway (the new version is backed up first).\n"
+                "Cancel: don't save.\n\n"
+                "Close Half-Life 2 before saving.\n\n" + path)
+            if answer is None:
+                return
+            if answer:
+                self.start_scan(confirm=False)
+                return
+        elif not messagebox.askokcancel(
                 "Save load order",
                 "Close Half-Life 2 before saving, or it may overwrite the file.\n\n"
-                "A backup of the current workshop.txt is made first.\n\n" + self.load_order_path):
+                + ("" if self.disk_ours else "A backup of the current workshop.txt is made first.\n\n") + path):
             return
+        entries = [(w, bool(e)) for w, e in self.order]
+        backup = None
         try:
-            if not self.backup_done:
-                backup = self.load_order_path + time.strftime(".%Y%m%d-%H%M%S.bak")
-                shutil.copy2(self.load_order_path, backup)
-                self.backup_done = True
-            ac.write_load_order(self.load_order_path, [(w, e) for w, e in self.order])
+            # Keep every version the organizer didn't write itself.
+            if os.path.exists(path) and (changed or not self.disk_ours):
+                backup = unique_path(path + time.strftime(".%Y%m%d-%H%M%S"), ".bak")
+                shutil.copy2(path, backup)
+            ac.write_load_order(path, entries)
         except OSError as e:
             messagebox.showerror("Couldn't save", str(e))
             return
+        self.disk_entries, self.disk_ours = entries, True
         self.saved_order = [list(e) for e in self.order]
         self.refresh_status()
-        self.status.config(text="Saved.")
+        self.status.config(text="Saved. The old file was backed up as %s." % os.path.basename(backup) if backup
+                           else "Saved.")
 
     def revert_order(self):
         if self.is_dirty() and messagebox.askyesno("Revert", "Go back to the last saved load order?"):
@@ -1588,7 +1886,7 @@ class Organizer:
                    ("Addons missing from workshop.txt skipped", unlisted,
                     "Installed, but not in the game's list yet. Start the game once to refresh it."),
                    ("Leftover folders skipped", self.leftovers,
-                    "These only hold cache files, left behind by addons you removed. Safe to delete.")]
+                    "These hold no addon files, only cache files or nothing at all.")]
         ac.LOAD_ORDER_NOTE = ("Assumes the addon lower in the list wins." if self.last_wins.get()
                               else "Assumes the addon higher in the list wins.")
         text = ac.format_report(active, skipped, self.containers, self.load_order_path,
@@ -1646,6 +1944,12 @@ class Organizer:
             self.selected = a
             self.refresh_details()
             self.highlight_relations()
+        elif a is None:
+            self.detail_title.config(text=self.overview_title())  # how many are selected may have changed
+
+    def overview_title(self):
+        n = len(self.tree.selection())
+        return "%d addons selected" % n if n > 1 else "Your setup"
 
     def relations(self, addon):
         """other addon -> {"wins": [paths], "loses": [paths], "reverted": [paths], "same": [paths], ...}
@@ -1673,6 +1977,8 @@ class Organizer:
         return rel
 
     def file_state(self, addon, path, content):
+        if addon.workshop_id and addon.rank is None:
+            return "not loaded (turned off)" if addon.position else "not loaded (not in workshop.txt)"
         copies = [c for c in self.by_path.get(path, []) if c[0] is not addon]
         original = self.base.get(path) == content
         if not copies:
@@ -1703,9 +2009,8 @@ class Organizer:
         self.notes_row.pack_forget()
         self.overview.pack(fill="x", pady=(self.px(10), 0))
         listed = [self.by_id[w] for w in self.listed_ids()]
-        conflicts = sum(1 for p, copies in self.by_path.items() if len({(s, c) for _, s, c in copies}) > 1)
         tiles = [(len(self.addons), "addons"), (sum(1 for a in listed if a.rank is not None), "turned on"),
-                 (conflicts, "conflicting files"), (len(self.removable), "do nothing")]
+                 (len(self.conflict_paths), "conflicting files"), (len(self.removable), "do nothing")]
         for n, (value, label) in enumerate(tiles):
             tile = ttk.Frame(self.overview, style="Card.TFrame")
             tile.grid(row=0, column=n, sticky="w", padx=(0, self.px(26)))
@@ -1718,8 +2023,8 @@ class Organizer:
         a = self.selected
         self.selected_rel = {}
         if a is None:
-            n = len(self.tree.selection())
-            self.detail_title.config(text="%d addons selected" % n if n > 1 else "Your setup")
+            self.note_key = None
+            self.detail_title.config(text=self.overview_title())
             self.detail_info.config(text="Select an addon to see what it conflicts with. Drag to reorder, click "
                                          "the checkbox or press Space to turn addons on or off, right-click for "
                                          "more.")
@@ -1728,7 +2033,9 @@ class Organizer:
         self.overview.pack_forget()
         self.actions.pack(fill="x", pady=(self.px(8), 0))
         self.notes_row.pack(fill="x", pady=(self.px(8), 0))
-        self.note_text.set(self.notes.get(self.addon_key(a), ""))
+        if self.addon_key(a) != self.note_key:  # the same addon again: keep what's being typed
+            self.note_key = self.addon_key(a)
+            self.note_text.set(self.notes.get(self.note_key, ""))
         self.detail_title.config(text=a.name)
         info = [self.status_text(a) or ("loaded, #%d" % a.position if a.position else "loaded"),
                 ac.plural(len(a.files), "file"), ac.nice_size(self.sizes.get(a, 0))]
@@ -1787,7 +2094,7 @@ class Organizer:
         for path in sorted(a.files):
             state = self.file_state(a, path, a.files[path])
             tag = "used" if state.startswith("used") else "lost" if state.startswith(("overwritten", "undone")) \
-                else "note"
+                else "inactive" if state.startswith("not loaded") else "note"
             self.files_tree.insert("", "end", text=path, values=(state,), tags=(tag,))
 
     def refresh_rules(self):
@@ -1847,7 +2154,8 @@ class Organizer:
             self.save_settings()
             self.recompute()
 
-    def run_find(self):
+    def run_find(self, select_tab=True):
+        """select_tab: False when only refreshing the results after a change, so the tab shown stays."""
         query = self.find_text.get().strip()
         open_paths = {self.find_tree.item(i, "text") for i in self.find_tree.get_children()
                       if self.find_tree.item(i, "open")}
@@ -1855,7 +2163,8 @@ class Organizer:
         self.find_rows = {}
         if not query:
             return
-        self.tabs.select(self.find_tab)
+        if select_tab:
+            self.tabs.select(self.find_tab)
         results, total = ac.find_files(query, self.addons, self.by_path, self.base)
         if not results:
             self.find_tree.insert("", "end", text="No addon has a file matching \"%s\"" % query, tags=("note",))
@@ -1890,7 +2199,8 @@ class Organizer:
         if a:
             self.jump_to(a)
             self.tabs.select(self.find_tab)  # stay on the search results
-        return "break"
+            return "break"
+        # A file row: let the double-click open or close it as usual.
 
     def jump_to_other(self, event):
         other = self.selected_other()
@@ -1909,8 +2219,8 @@ class Organizer:
             "overwrite it red.\n\n"
             "Rules (Conflicts tab) say which addon should win; Sort by rules applies them with as little "
             "movement as possible.\n\n"
-            "Changes only reach the game when you Save. Close the game first; a backup of workshop.txt is "
-            "made the first time you save."))
+            "Changes only reach the game when you Save. Close the game first. Before the organizer replaces a "
+            "workshop.txt it didn't write itself, it keeps a backup of it."))
 
 
 def main():
