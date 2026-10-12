@@ -347,7 +347,8 @@ def send_to_trash(path):
     if sys.platform == "win32":
         import ctypes
         from ctypes import wintypes
-        fields = [("hwnd", wintypes.HWND), ("wFunc", wintypes.UINT), ("pFrom", wintypes.LPCWSTR),
+        # pFrom is a list of paths ending in two nulls, which a c_wchar_p field won't take: a raw buffer.
+        fields = [("hwnd", wintypes.HWND), ("wFunc", wintypes.UINT), ("pFrom", ctypes.c_void_p),
                   ("pTo", wintypes.LPCWSTR), ("fFlags", ctypes.c_ushort), ("fAnyOperationsAborted", wintypes.BOOL),
                   ("hNameMappings", ctypes.c_void_p), ("lpszProgressTitle", wintypes.LPCWSTR)]
         attrs = {"_fields_": fields}
@@ -356,7 +357,9 @@ def send_to_trash(path):
         op_type = type("SHFILEOPSTRUCTW", (ctypes.Structure,), attrs)
         # FO_DELETE with ALLOWUNDO (Recycle Bin), NOCONFIRMATION, SILENT, NOERRORUI, WANTNUKEWARNING
         # (asks instead of deleting for good where there's no Recycle Bin, e.g. a network drive).
-        op = op_type(None, 3, path + "\0", None, 0x0040 | 0x0010 | 0x0004 | 0x0400 | 0x4000, False, None, None)
+        names = ctypes.create_unicode_buffer(path + "\0")  # the buffer adds the second null
+        op = op_type(None, 3, ctypes.cast(names, ctypes.c_void_p), None,
+                     0x0040 | 0x0010 | 0x0004 | 0x0400 | 0x4000, False, None, None)
         result = ctypes.windll.shell32.SHFileOperationW(ctypes.byref(op))
         if result or op.fAnyOperationsAborted or os.path.lexists(path):
             raise OSError("couldn't move %s to the Recycle Bin (error %d)" % (os.path.basename(path), result))
