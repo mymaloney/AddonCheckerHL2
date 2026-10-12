@@ -54,39 +54,56 @@ The exit code is 2 when conflicts were found and 0 when none were.
 python addon_organizer.py
 ```
 
-A mod-organizer-style window for your Workshop load order. Needs `addon_checker.py` in the same
-folder; tkinter comes with the python.org installer on Windows.
+A Mod Organizer-style window for your Workshop load order. Needs `addon_checker.py` in the same
+folder; tkinter comes with the python.org installer on Windows. Dark and light themes (View menu).
 
-- **Folders...:** shows which Half-Life 2 and Workshop folders are used, with *Browse...* buttons
-  to pick them yourself. A Steam library folder (e.g. `D:\SteamLibrary`) is fine too; the right
-  subfolders are found from there, and choosing one folder fills in the other from the same library.
-  The choice is remembered. This window also opens by itself if Steam can't be found.
-- **Load order list:** every addon with its position, on/off state, files, how many conflicts it
-  **wins** and **loses**, and a status: *does nothing*, *mostly nothing (N%)*, *rule broken*,
-  *disabled*, or *not in workshop.txt yet*.
-- **Reorder:** drag rows, or use Top / Up / Down / Bottom (works on several selected rows).
-  Double-click or Space turns an addon on or off.
-- **Conflicts tab:** for the selected addon, every addon it clashes with and how many files it wins,
-  loses or shares identically. Expand a row for the file list, or double-click it to jump to that addon.
-  `[!]` marks scripts, UI, cfg and map conflicts.
-- **Rules:** in the Conflicts tab, pick *This addon should win* or *The other should win*.
-  Rules are saved in `addon_rules.json` next to the tool. **Sort by rules** fixes every broken rule
-  by moving each rule's winner to just ahead of its loser, leaving everything else where it was.
-  Rules that go in a circle are reported instead.
-- **Move removable addons to the losing end:** moves every addon that does nothing to the end of
-  the list where it loses. The game plays the same, and they end up together in the game's
-  Add-ons screen for unsubscribing.
-- **Find file tab:** type part of a path (a map name like `d1_town_02`, or a pattern like
-  `maps/d1_town_*`) to see every matching file any addon has, and for each one which addon's copy
-  the game uses, which are overwritten, disabled or identical, and whether it's the original file.
-  A map name also finds its companion files (`maps/graphs/*.ain` node graphs, `_l_0.lmp` lighting
-  patches, map materials), which are a common cause of map bugs when they come from a different
-  addon than the `.bsp`. Double-click an addon to jump to it.
+**The load order list**
+
+- Click the checkbox (or press Space, or double-click) to turn addons on or off.
+- Drag rows to reorder, or use the arrow buttons / Ctrl+Up, Ctrl+Down, Ctrl+Home, Ctrl+End.
+  Several rows can be selected and moved together.
+- **Flags:** ▲ overwrites other addons, ▼ is overwritten, ✕ does nothing (every file is
+  overwritten, identical elsewhere, or identical to the original game).
+- **Select an addon** and the others are tinted: green for addons it overwrites, red for addons
+  that overwrite it.
+- Columns for type (Map, Sound, Model, Texture…), files, size, wins, loses, status and notes;
+  turn optional ones on or off in View. Click a heading to sort, click **#** to go back to load order.
+- **Filter** by name, id or note, and pick a view: has conflicts, overwrites others, is overwritten,
+  does nothing, mostly does nothing, disabled, rule broken, not in load order, has notes.
+- **Right-click** for on/off, moving, the Workshop page, the addon's folder, and copying its id.
+
+**The details side**
+
+- With nothing selected: an overview of your setup.
+- **Conflicts tab:** every addon the selected one clashes with, how many files it wins, loses or
+  shares identically, and the original game's files it leaves unchanged. Expand a row for the files;
+  double-click to jump to that addon. Set rules here: *This addon should win* / *The other should win*.
 - **Files tab:** every file in the addon and whether the game uses it, or which addon overwrites it.
-- **Lower in the list wins:** flips the assumed load order direction (saved with your rules).
-- **Save load order** writes `workshop.txt`, after backing the old one up as
+- **Find file tab:** type part of a path (a map name like `d1_town_02`, or `maps/d1_town_*`) to see
+  every addon with a matching file and which copy the game uses. A map name also finds its
+  companion files (`maps/graphs/*.ain` node graphs, `_l_0.lmp` lighting patches, map materials),
+  a common cause of map bugs when they come from a different addon than the `.bsp`.
+- **Rules tab:** all rules, and which are broken. **Sort by rules** fixes broken ones by moving each
+  winner just ahead of its loser, leaving everything else where it was.
+- **Notes:** a note per addon, shown in the Notes column and searchable with the filter.
+
+**Toolbar and menus**
+
+- **Save load order** (Ctrl+S) writes `workshop.txt` after backing up the old one as
   `workshop.txt.<date>-<time>.bak`. **Close the game first**, since it may rewrite the file.
-  *Undo changes* goes back to the last saved order.
+- **Undo / Redo** (Ctrl+Z / Ctrl+Y) every load order change; File > Revert to saved.
+- **Group idle addons** moves every addon that does nothing to the losing end of the list. The game
+  plays the same, and they end up together in the game's Add-ons screen for unsubscribing.
+- **Profiles:** save the current order and on/off states under a name, and switch between them.
+- **Problems** lists anything that needs attention (broken rules, unreadable addons, addons not in
+  `workshop.txt` yet, leftover folders) with a button to fix each; leftover folders can be deleted
+  there after a confirmation.
+- **Folders...** shows which Half-Life 2 and Workshop folders are used, with *Browse...* buttons.
+  A Steam library folder (e.g. `D:\SteamLibrary`) is fine too. It opens by itself if Steam can't be found.
+- File > **Export report...** writes the same report as `addon_checker.py` for the current order.
+- View > **Lower in the list wins** flips the assumed load order direction.
+
+Rules, notes, profiles, theme and window layout are kept in `addon_rules.json` next to the tool.
 
 ## What it reads
 
