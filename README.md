@@ -48,7 +48,6 @@ Use `--offline` to skip that and show item IDs instead.
 | `--min-dupe-size N` | Smallest file in bytes checked for content duplicates (default 1024) |
 | `--offline` | Don't look up Workshop titles |
 | `--load-order FILE` | The game's `workshop.txt`, if it isn't found automatically |
-| `--last-wins` | The addon lower in `workshop.txt` wins conflicts |
 | `--find TEXT` | Only list files matching `TEXT` (e.g. `d1_town_02`, `maps/d1_town_*`) and what each addon does with them |
 | `--all` | Also check disabled addons and ones missing from `workshop.txt` |
 | `--game-dir FOLDER` | The Half-Life 2 folder to use, if the right one isn't found automatically |
@@ -98,7 +97,11 @@ folder; tkinter comes with the python.org installer on Windows. Dark and light t
 **`custom/` addons**
 
 - They're shown first, as **C1, C2…**, in the order the game loads them: ahead of the Workshop addons,
-  A to Z by folder name. Rename the folder to change its place.
+  A to Z by folder name. Every Workshop addon loads later, so it wins over them; among themselves, Z
+  beats A. Rename the folder to change its place.
+- **The checkbox** turns one off by moving it to `custom_disabled/`, next to its `custom/` folder (the
+  game loads everything inside `custom/`, so it can't stay there), and back on again. This happens right
+  away, without Save. A name that's already taken on the other side is never overwritten.
 - **Install addon...** (toolbar and File menu) copies an addon into the game's `custom/` folder (the first
   one `gameinfo.txt` lists, usually `hl2_complete/custom`). On Windows you can also **drop** files and
   folders from Explorer onto the window. It takes:
@@ -122,7 +125,6 @@ folder; tkinter comes with the python.org installer on Windows. Dark and light t
 - **Folders...** shows which Half-Life 2 and Workshop folders are used, with *Browse...* buttons.
   A Steam library folder (e.g. `D:\SteamLibrary`) is fine too. It opens by itself if Steam can't be found.
 - File > **Export report...** writes the same report as `addon_checker.py` for the current order.
-- View > **Lower in the list wins** flips the assumed load order direction.
 
 Rules, notes, profiles, theme and window layout are kept in `addon_rules.json` next to the tool.
 
@@ -161,13 +163,10 @@ The game keeps your Workshop addons' load order in
   The game only updates the list when it starts, so launch it once after subscribing to something.
 - `--all` checks them anyway, as if they were enabled; only the addons the game really loads decide
   which addons do nothing, though.
-- **Which end of the list wins is assumed: the addon higher in the list (smaller `#N`).**
-  If the game turns out to work the other way, use `--last-wins`.
-  To check: find a conflict in the report where you can tell the addons apart in game
-  (a map or a weapon model), see which one you get, and compare their `#N`.
+- **The addon that loads later wins:** the one lower in the list (larger `#N`).
 - `custom/` addons load ahead of every Workshop addon, A to Z by folder name (custom folder by custom
-  folder, in `gameinfo.txt`'s order). So with the assumption above a `custom/` addon beats any Workshop
-  addon, and `--last-wins` flips that too.
+  folder, in `gameinfo.txt`'s order). So any Workshop addon beats a `custom/` addon, and among `custom/`
+  addons Z beats A. Addons in `custom_disabled/` (the organizer's "off") aren't loaded or checked.
 
 ## Tests
 

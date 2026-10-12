@@ -211,6 +211,14 @@ class InstallError(Exception):
     pass
 
 
+# The game loads everything inside custom/, so a turned-off custom/ addon is moved next to it, here.
+DISABLED_FOLDER = "custom_disabled"
+
+
+def disabled_dir(custom_dir):
+    return os.path.join(os.path.dirname(custom_dir), DISABLED_FOLDER)
+
+
 def addon_root(folder):
     """An addon is often wrapped in one more folder ("myaddon/myaddon/materials"): skip such
     wrappers, down to the folder that holds the content."""
@@ -398,6 +406,7 @@ class Organizer:
         # Stands in for the original game in the Conflicts tab.
         self.base_addon = ac.Addon(name="Half-Life 2 (original game files)", location="(base game)")
         self.leftovers = []
+        self.custom_dirs = []     # the custom/ folders the game loads, in its order
         self.strays = []          # in the Workshop folder but not item folders: never loaded
         self.empty_folders = []   # custom/ folders with no addon files
         self.together = {}        # removable addon -> the others it may only be removed with
@@ -406,7 +415,9 @@ class Organizer:
         self.profiles = {}        # name -> [[id, enabled]]
         self.settings = {}
         self.types, self.sizes = {}, {}
-        self.last_wins = tk.BooleanVar(value=False)
+        # The addon that loads later wins (confirmed in game): lower in workshop.txt beats higher,
+        # and every Workshop addon beats the custom/ ones, which load first.
+        self.last_wins = tk.BooleanVar(value=True)
         self.filter_text = tk.StringVar()
         self.view = tk.StringVar(value=VIEWS[0])
         self.find_text = tk.StringVar()
@@ -497,7 +508,6 @@ class Organizer:
         self.rules = [dict(r, winner=str(r["winner"]), loser=str(r["loser"])) for r in get("rules", list, [])
                       if isinstance(r, dict) and isinstance(r.get("winner"), (str, int))
                       and isinstance(r.get("loser"), (str, int)) and r["winner"] and r["loser"]]
-        self.last_wins.set(bool(data.get("last_wins", False)))
         self.game_dir = get("game_dir", str, "") or None
         self.workshop_dir = get("workshop_dir", str, "") or None
         self.notes = {k: v for k, v in get("notes", dict, {}).items() if isinstance(v, str)}
@@ -513,10 +523,11 @@ class Organizer:
         if self.keep_settings_file:
             return
         self.settings.update({
-            "game_dir": self.game_dir, "workshop_dir": self.workshop_dir, "last_wins": self.last_wins.get(),
+            "game_dir": self.game_dir, "workshop_dir": self.workshop_dir,
             "theme": self.theme_name.get(), "hidden_columns": self.hidden_columns,
             "rules": self.rules, "notes": self.notes, "profiles": self.profiles,
         })
+        self.settings.pop("last_wins", None)  # an old setting: the later addon always wins
         # Through a temp file, so a write that's cut short (disk full, crash) can't damage the old one.
         tmp = SETTINGS_FILE + ".tmp"
         try:
@@ -701,7 +712,6 @@ class Organizer:
                 self.column_vars[col] = var
                 v.add_checkbutton(label="Show %s column" % heading, variable=var, command=self.on_columns_changed)
         v.add_separator()
-        v.add_checkbutton(label="Lower in the list wins", variable=self.last_wins)
 
         h = menu("Help")
         h.add_command(label="How it works", command=self.show_help)
@@ -1086,8 +1096,14 @@ class Organizer:
             workshop = workshop or (game and ac.workshop_dir_for_game(game))
             game = game or (workshop and ac.game_dir_for_workshop(workshop))
             containers, path = ac.game_folders(game, workshop)
-            addons = (ac.scan(containers, progress, workshop_dirs=[workshop] if workshop else [], slow=slow)
-                      if containers else [])
+            custom_dirs = ac.mounted_custom_dirs(game, existing=False) if game else []
+            off_dirs = [d for d in (disabled_dir(c) for c in custom_dirs) if os.path.isdir(d)]
+            addons = (ac.scan(containers + off_dirs, progress, workshop_dirs=[workshop] if workshop else [],
+                              slow=slow) if containers or off_dirs else [])
+            off_keys = {os.path.normcase(os.path.abspath(d)) for d in off_dirs}
+            for a in addons:
+                a.custom_off = os.path.normcase(os.path.dirname(os.path.abspath(a.location))) in off_keys
+            self.custom_dirs = custom_dirs
             ids = {a.workshop_id for a in addons if a.workshop_id}
             if ids:
                 self.set_status("Looking up Workshop titles on Steam...")
@@ -1212,6 +1228,8 @@ class Organizer:
         active = []
         for a in self.addons:
             a.position = a.rank = None
+            if a.custom_off:
+                continue  # in custom_disabled/: the game doesn't load it
             if a.workshop_id:
                 if a.workshop_id not in positions:
                     continue  # not in workshop.txt: the game doesn't load it yet
@@ -1221,7 +1239,7 @@ class Organizer:
                     continue
                 a.rank = -n if last_wins else n
             active.append(a)
-        ac.rank_custom_addons(self.addons, last_wins)  # ahead of the Workshop ones, A to Z
+        ac.rank_custom_addons(self.custom_order(), last_wins)  # ahead of the Workshop ones, A to Z
 
         # Moving an addon doesn't change which files are loaded, only who wins, so the index of every
         # loaded file is only rebuilt when an addon is turned on or off.
@@ -1280,6 +1298,8 @@ class Organizer:
         return self.by_id.get(key)
 
     def status_text(self, a):
+        if a.custom_off:
+            return "disabled"
         if a.workshop_id and a.position is None:
             return "not in workshop.txt yet"
         if a.workshop_id and a.rank is None:
@@ -1360,8 +1380,9 @@ class Organizer:
         view = self.view.get()
         broken = self.broken_ids()
 
-        custom = [a for a in self.addons if not a.workshop_id]  # load first, A to Z (see recompute)
-        rows = custom + [self.by_id[w] for w in self.listed_ids()]
+        custom = self.custom_order()  # load first, A to Z (see recompute)
+        rows = custom + sorted((a for a in self.addons if a.custom_off), key=lambda a: a.name.lower())
+        rows += [self.by_id[w] for w in self.listed_ids()]
         rows += sorted((a for a in self.addons if a.workshop_id and a.position is None), key=lambda a: a.name.lower())
         rows = [a for a in rows if (not needle or needle in a.name.lower() or needle in (a.workshop_id or "")
                                     or needle in self.notes.get(self.addon_key(a), "").lower())
@@ -1391,7 +1412,10 @@ class Organizer:
                 fg = "nothing"
             elif a.position is None:
                 fg = "fixed"
-            on = "" if a.position is None else ("☑" if a.rank is not None else "☐")
+            if not a.workshop_id:
+                on = "☐" if a.custom_off else "☑"
+            else:
+                on = "" if a.position is None else ("☑" if a.rank is not None else "☐")
             key = self.addon_key(a)
             self.row_tags[key] = (fg, bg)
             place = a.position or ("C%d" % (custom.index(a) + 1) if a in custom else "")
@@ -1507,12 +1531,70 @@ class Organizer:
         self.tree.see(chosen[0])
 
     def toggle_enabled(self, keys=None, soon=False):
+        if keys is None:
+            custom = [k for k in self.tree.selection() if k.startswith("custom:")]
+            if custom:
+                self.toggle_custom(custom)
         sel = keys or self.movable_selection()
         if not sel:
             return "break"
         turn_on = not all(e for w, e in self.order if w in sel)
         self.set_order([[w, turn_on if w in sel else e] for w, e in self.order], soon=soon)
         return "break"
+
+    def custom_order(self):
+        """The custom/ addons the game loads, in its order: custom/ folder by custom/ folder as
+        gameinfo.txt lists them, A to Z by name within each."""
+        dirs = [os.path.normcase(os.path.abspath(d)) for d in getattr(self, "custom_dirs", [])]
+
+        def key(a):
+            folder = os.path.normcase(os.path.dirname(os.path.abspath(a.location)))
+            return dirs.index(folder) if folder in dirs else len(dirs), ac.name_order(os.path.basename(a.location))
+        return sorted((a for a in self.addons if not a.workshop_id and not a.custom_off), key=key)
+
+    def toggle_custom(self, keys):
+        """Turns custom/ addons on or off by moving them between custom/ and custom_disabled/
+        right away (the game reads folders, not a list). Like the Workshop checkboxes: if any
+        is off they're all turned on, else all off."""
+        addons = [a for a in (self.addon_for_key(k) for k in keys) if a and not a.workshop_id]
+        if not addons:
+            return
+        turn_on = any(a.custom_off for a in addons)
+        moved, problems = [], []
+        for a in addons:
+            if a.custom_off != turn_on:
+                continue  # already that way
+            folder, name = os.path.split(os.path.abspath(a.location))
+            if turn_on:
+                dest_dir = os.path.join(os.path.dirname(folder), "custom")
+            else:
+                dest_dir = disabled_dir(folder)
+            dest = os.path.join(dest_dir, name)
+            if os.path.lexists(dest):
+                problems.append("%s: %s already has one with that name" % (name, dest_dir))
+                continue
+            try:
+                os.makedirs(dest_dir, exist_ok=True)
+                os.replace(a.location, dest)
+            except OSError as e:
+                problems.append("%s: %s (close the game if it's running)" % (name, e.strerror or e))
+                continue
+            old_key = self.addon_key(a)
+            a.location, a.custom_off = dest, not turn_on
+            a.name = "%s/%s/%s" % (os.path.basename(os.path.dirname(dest_dir)), os.path.basename(dest_dir), name)
+            if old_key in self.notes:
+                self.notes[self.addon_key(a)] = self.notes.pop(old_key)
+            moved.append(name)
+        if moved:
+            self.save_settings()
+            self.recompute()
+            self.tree.selection_set([self.addon_key(a) for a in addons if self.tree.exists(self.addon_key(a))])
+            self.status.config(text="%s %s (moved to %s)." % ("Turned on" if turn_on else "Turned off",
+                                                             ", ".join(moved[:3]) + (" and more" if len(moved) > 3
+                                                                                     else ""),
+                                                             "custom" if turn_on else DISABLED_FOLDER))
+        if problems:
+            messagebox.showwarning("custom/ addons", "\n".join(problems[:8]))
 
     def column_at(self, x):
         col = self.tree.identify_column(x)
@@ -1529,6 +1611,11 @@ class Organizer:
         if self.list_rebuilt:
             return "break"  # pressed while the list was being rebuilt: the row under it has changed
         row = self.tree.identify_row(event.y)
+        if row.startswith("custom:") and self.column_at(event.x) == "on":
+            self.toggle_custom([row])
+            if self.tree.exists(row):
+                self.tree.selection_set(row)
+            return "break"
         if not row or row not in self.by_id or self.by_id[row].position is None:
             return
         if self.column_at(event.x) == "on":
@@ -2061,7 +2148,7 @@ class Organizer:
                                             initialfile="addon_report.txt", filetypes=[("Text", "*.txt")])
         if not path:
             return
-        active = [a for a in self.addons if a.rank is not None or not a.workshop_id]
+        active = [a for a in self.addons if a.rank is not None or (not a.workshop_id and not a.custom_off)]
         disabled = [a for a in self.addons if a.workshop_id and a.position is not None and a.rank is None]
         unlisted = [a for a in self.addons if a.workshop_id and a.position is None]
         skipped = [("Disabled addons skipped", disabled, "Turned off in the game's Add-ons menu."),
@@ -2072,8 +2159,6 @@ class Organizer:
                     "The game never loads these."),
                    ("Leftover folders skipped", self.leftovers,
                     "These only hold cache files, left behind by addons you removed. Safe to delete.")]
-        ac.LOAD_ORDER_NOTE = ("Assumes the addon lower in the list wins." if self.last_wins.get()
-                              else "Assumes the addon higher in the list wins.")
         text = ac.format_report(active, skipped, self.containers, self.load_order_path,
                                 ac.analyze(active, 1024, self.base), 0, self.base_info)
         try:
@@ -2469,8 +2554,9 @@ class Organizer:
 
     def show_help(self):
         messagebox.showinfo("How it works", (
-            "The list is your Workshop load order from workshop.txt. By default the addon higher in the "
-            "list wins when two addons have the same file (View > Lower in the list wins flips that).\n\n"
+            "The list is the load order: your custom/ addons first (A to Z), then the Workshop addons in "
+            "workshop.txt's order. The addon lower in the list loads later and wins when two addons have "
+            "the same file.\n\n"
             "Flags: ▲ overwrites other addons, ▼ is overwritten, ✕ does nothing (every file is overwritten "
             "or identical elsewhere).\n\n"
             "Select an addon to see its conflicts. Addons it overwrites are tinted green, addons that "

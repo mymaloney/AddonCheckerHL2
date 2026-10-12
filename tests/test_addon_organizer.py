@@ -641,9 +641,9 @@ class OrganizerTest(unittest.TestCase):
                      "Addon 333 should win over Addon 111"):
             self.assertIn(line, errors[0][2])
         self.assertNotIn("Addon 555", errors[0][2])
-        # The rule outside the circle is applied.
+        # The rule outside the circle is applied: the winner loads later.
         ids = app.listed_ids()
-        self.assertLess(ids.index("555"), ids.index("111"))
+        self.assertGreater(ids.index("555"), ids.index("111"))
 
     def test_delete_leftovers(self):  # org-09
         cache = os.path.join(self.workshop, "999", "workshop.vpk.sound.cache")
@@ -725,15 +725,15 @@ class OrganizerTest(unittest.TestCase):
         self.assertEqual(app.status_text(a), "problem reading")
 
     def test_removable_only_together(self):
-        # 111 = X (#1), 222 = Y (#2), 333 = X plus its own file (#3): 111 and 222 do nothing together,
-        # but without 222, removing 111 alone would make 222's Y the one used.
+        # 111 = X (#3, loads last), 222 = Y (#2), 333 = X plus its own file (#1): 111 and 222 do nothing
+        # together, but without 222, removing 111 alone would make 222's Y the one used.
         addons = {"111": {"materials/w.vtf": b"X"}, "222": {"materials/w.vtf": b"Y"},
                   "333": {"materials/w.vtf": b"X", "maps/own.bsp": b"own"}}
         shutil.rmtree(self.workshop)
         for wsid, files in addons.items():
             for path, data in files.items():
                 write(os.path.join(self.workshop, wsid, *path.split("/")), data)
-        write(self.txt, order_text([("111", True), ("222", True), ("333", True)]))
+        write(self.txt, order_text([("333", True), ("222", True), ("111", True)]))
         app = self.open()
         self.assertEqual({a.workshop_id for a in app.removable}, {"111", "222"})
         self.assertEqual(app.status_text(app.by_id["222"]), "does nothing")
@@ -757,11 +757,46 @@ class OrganizerTest(unittest.TestCase):
         customs = ["custom:" + os.path.join(self.game, "hl2", "custom", n) for n in ("aaa", "mymod")]
         self.assertEqual(list(rows[:2]), customs)
         self.assertEqual([self.row(k, "pos") for k in customs], ["C1", "C2"])
-        # aaa's wall beats every Workshop addon's.
-        self.assertEqual(app.stats[app.addon_for_key(customs[0])][0], 1)
-        app.last_wins.set(True)
+        # They load first, so every Workshop addon's wall beats aaa's.
+        self.assertEqual(app.stats[app.addon_for_key(customs[0])], [0, 1])
+
+    def test_turning_a_custom_addon_off_and_on(self):
+        mymod = os.path.join(self.game, "hl2", "custom", "mymod")
+        off = os.path.join(self.game, "hl2", "custom_disabled", "mymod")
+        app = self.open()
+        key = "custom:" + mymod
+        app.notes[key] = "my texture fix"
+        self.click(key, col="on")
         self.pump()
-        self.assertEqual(app.stats[app.addon_for_key(customs[0])][1], 1)  # now it loses
+        self.assertFalse(os.path.exists(mymod))
+        self.assertTrue(os.path.isfile(os.path.join(off, "materials", "custom", "c.vtf")))
+        a = app.addon_for_key("custom:" + off)
+        self.assertTrue(a.custom_off)
+        self.assertIsNone(a.rank)
+        self.assertEqual(self.row("custom:" + off, "on"), "☐")
+        self.assertEqual(app.status_text(a), "disabled")
+        self.assertEqual(app.notes.get("custom:" + off), "my texture fix")  # the note moves along
+        # A rescan finds it in custom_disabled/, still off.
+        app.start_scan(confirm=False)
+        self.wait()
+        self.assertTrue(app.addon_for_key("custom:" + off).custom_off)
+        # Space turns it back on.
+        app.tree.selection_set("custom:" + off)
+        app.toggle_enabled()
+        self.pump()
+        self.assertTrue(os.path.isdir(mymod) and not os.path.exists(off))
+        self.assertEqual(self.row(key, "pos"), "C1")
+
+    def test_turning_on_doesnt_overwrite(self):
+        write(os.path.join(self.game, "hl2", "custom_disabled", "mymod", "materials", "old.vtf"), b"old")
+        app = self.open()
+        self.click("custom:" + os.path.join(self.game, "hl2", "custom_disabled", "mymod"), col="on")
+        self.pump()
+        self.assertTrue(any("already has one" in d[2] for d in self.dialogs))
+        self.assertTrue(os.path.isfile(os.path.join(self.game, "hl2", "custom", "mymod", "materials", "custom",
+                                                    "c.vtf")))
+        self.assertTrue(app.addon_for_key("custom:" + os.path.join(self.game, "hl2", "custom_disabled",
+                                                                   "mymod")).custom_off)
 
     def install(self, *paths):
         self.app.install_paths(list(paths))

@@ -516,7 +516,7 @@ class MixedModels(unittest.TestCase):
 
 
 class CustomLoadOrder(Base):
-    """custom/ addons load ahead of every Workshop addon, A to Z by folder name."""
+    """custom/ addons load ahead of every Workshop addon, A to Z by folder name; the later one wins."""
 
     def setup_folders(self):
         lib, game, workshop = self.library(items={"111": {"scripts/w.txt": "workshop"}}, order=[("111", 1)],
@@ -531,27 +531,25 @@ class CustomLoadOrder(Base):
         start = lines.index("  [!] scripts/w.txt")
         return [l.strip() for l in lines[start + 1:start + 4]]
 
-    def test_custom_first_a_to_z(self):
-        self.assertEqual(self.winner(), ["hl2/custom/A_mod  (1 bytes)  <- used",
+    def test_workshop_beats_custom_and_z_beats_a(self):
+        self.assertEqual(self.winner(), ["workshop/111  [#1]  (8 bytes)  <- used",
                                          "hl2/custom/b_mod  (1 bytes)",
-                                         "workshop/111  [#1]  (8 bytes)"])
+                                         "hl2/custom/A_mod  (1 bytes)"])
 
-    def test_last_wins_flips_it(self):
-        self.assertEqual(self.winner("--last-wins"), ["workshop/111  [#1]  (8 bytes)  <- used",
-                                                      "hl2/custom/b_mod  (1 bytes)",
-                                                      "hl2/custom/A_mod  (1 bytes)"])
+    def test_old_last_wins_option_is_still_accepted(self):
+        self.assertEqual(self.winner("--last-wins"), self.winner())
 
     def test_without_workshop_txt_custom_order_is_still_known(self):
         self.addon("c", "b", {"scripts/w.txt": "b"})
         self.addon("c", "a", {"scripts/w.txt": "a"})
         code, out = run_main("--offline", "--no-base-game", "--out", self.path("r.txt"), self.path("c"))
-        self.assertIn("      tmp/c/a  (1 bytes)  <- used".replace("tmp", os.path.basename(self.tmp)), out)
+        self.assertIn("      tmp/c/b  (1 bytes)  <- used".replace("tmp", os.path.basename(self.tmp)), out)
 
     def test_overwritten_custom_addon_is_removable(self):
-        top = addon("a", {"materials/x.vtf": "new"})
-        low = addon("b", {"materials/x.vtf": "old"})
-        ac.rank_custom_addons([top, low])
-        self.assertEqual(ac.find_idle_addons([top, low], ac.index_files([top, low]))[0], {low})
+        loses = addon("a", {"materials/x.vtf": "old"})
+        wins = addon("b", {"materials/x.vtf": "new"})  # later A to Z
+        ac.rank_custom_addons([loses, wins])
+        self.assertEqual(ac.find_idle_addons([loses, wins], ac.index_files([loses, wins]))[0], {loses})
 
 
 # ---------------------------------------------------------------------------
@@ -653,7 +651,7 @@ class CommandLine(Base):
         lib, game, workshop = self.library(items={"111": {"maps/d1_town_02.bsp": "a"}, "222": {"maps/d1_town_02.bsp": "b"}},
                                            order=[("222", 1), ("111", 1)])
         code, out = run_main("--offline", "--no-base-game", "--find", "d1_town_02", workshop)
-        self.assertIn("used: workshop/222", out)
+        self.assertIn("used: workshop/111", out)  # lower in workshop.txt: loads later, wins
         self.assertEqual(code, 0)
 
     def test_non_utf8_output(self):

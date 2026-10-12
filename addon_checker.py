@@ -66,6 +66,7 @@ class Addon:
     leftover: bool = False  # Workshop folder that only holds cache files: the addon was removed
     stray: bool = False  # in the Workshop folder but not an item folder: the game never loads it
     in_workshop: bool = False  # found in a Workshop folder
+    custom_off: bool = False  # custom/ addon moved to custom_disabled/ (the organizer's "off")
     rank: int = None  # load order position, lower = wins conflicts; None = unknown
     position: int = None  # 1-based line in workshop.txt, for display
 
@@ -920,12 +921,13 @@ def find_install(game_dir=None):
 # Analysis + report
 # ---------------------------------------------------------------------------
 
-def rank_custom_addons(addons, last_wins=False):
-    """The game loads custom/ addons ahead of every Workshop addon, A to Z by folder name. The
-    scan already lists them in that order (custom/ folder by custom/ folder, in gameinfo.txt's
-    order), so their ranks come before the Workshop ranks (0, 1, 2... from workshop.txt), or
-    after them when the lower addon in the list wins. Returns them in load order."""
-    custom = [a for a in addons if not a.workshop_id and not a.stray and not a.leftover]
+def rank_custom_addons(addons, last_wins=True):
+    """The game loads custom/ addons ahead of every Workshop addon, A to Z by folder name, and the
+    addon that loads later wins. The scan already lists them in that order (custom/ folder by
+    custom/ folder, in gameinfo.txt's order), so they rank behind every Workshop addon (whose
+    ranks are 0, -1, -2... from workshop.txt), Z beating A. Returns them in load order.
+    last_wins=False is the opposite model, kept for tests of the ranking itself."""
+    custom = [a for a in addons if not a.workshop_id and not a.stray and not a.leftover and not a.custom_off]
     for n, a in enumerate(custom):
         a.rank = len(custom) - n if last_wins else n - len(custom)
     return custom
@@ -1475,7 +1477,7 @@ def format_report(addons, skipped, containers, load_order, analysis, limit, base
     return "\n".join(out) + "\n"
 
 
-LOAD_ORDER_NOTE = "Assumes the addon higher in the list wins."
+LOAD_ORDER_NOTE = "The addon lower in the list loads later and wins."
 
 
 def guess_game_dir(chosen, containers):
@@ -1516,7 +1518,6 @@ def use_safe_output():
 
 
 def main():
-    global LOAD_ORDER_NOTE
     ap = argparse.ArgumentParser(description="Find Half-Life 2 addons that conflict or duplicate each other.")
     ap.add_argument("folders", nargs="*",
                     help="folders containing addons (workshop/content/220, hl2/custom...). Default: find automatically")
@@ -1527,8 +1528,8 @@ def main():
     ap.add_argument("--offline", action="store_true", help="don't look up Workshop item titles on Steam")
     ap.add_argument("--load-order", metavar="FILE",
                     help="the game's workshop.txt (default: Half-Life 2/hl2_complete/cfg/workshop.txt)")
-    ap.add_argument("--last-wins", action="store_true",
-                    help="the addon lower in workshop.txt wins conflicts, instead of the higher one")
+    # The game was found to always work this way; the option is still accepted.
+    ap.add_argument("--last-wins", action="store_true", help=argparse.SUPPRESS)
     ap.add_argument("--game-dir", metavar="FOLDER",
                     help="the Half-Life 2 folder (default: found automatically). Without folders to scan, "
                          "its Workshop and custom folders are scanned")
@@ -1588,7 +1589,7 @@ def main():
     stray = [a for a in addons if a.stray and not a.leftover]
     addons = [a for a in addons if not a.leftover and not a.stray]
 
-    rank_custom_addons(addons, args.last_wins)
+    rank_custom_addons(addons)
     disabled, unlisted = [], []
     loaded = None  # with --all: the addons the game really loads
     if load_order:
@@ -1602,8 +1603,6 @@ def main():
               "Pass the workshop/content/220 folder itself.", file=sys.stderr)
     if load_order:
         info = {wsid: (n, enabled) for n, (wsid, enabled) in enumerate(entries)}
-        if args.last_wins:
-            LOAD_ORDER_NOTE = "Assumes the addon lower in the list wins (--last-wins)."
         active = []
         for a in addons:
             if not a.workshop_id:
@@ -1620,7 +1619,7 @@ def main():
                 disabled.append(a)
                 if not args.all:
                     continue
-            a.rank = -n if args.last_wins else n
+            a.rank = -n  # later in workshop.txt loads later and wins
             active.append(a)
         if args.all:
             loaded = [a for a in active if a not in disabled and a not in unlisted]
