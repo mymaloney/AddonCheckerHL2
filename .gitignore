@@ -39,3 +39,7 @@ luac.out
 *.x86_64
 *.hex
 
+
+# Standalone checker build
+/addon_checker
+addon_report.txt
