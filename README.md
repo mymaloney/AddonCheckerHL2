@@ -55,6 +55,10 @@ python addon_organizer.py
 A mod-organizer-style window for your Workshop load order. Needs `addon_checker.py` in the same
 folder; tkinter comes with the python.org installer on Windows.
 
+- **Folders...:** shows which Half-Life 2 and Workshop folders are used, with *Browse...* buttons
+  to pick them yourself. A Steam library folder (e.g. `D:\SteamLibrary`) is fine too; the right
+  subfolders are found from there, and choosing one folder fills in the other from the same library.
+  The choice is remembered. This window also opens by itself if Steam can't be found.
 - **Load order list:** every addon with its position, on/off state, files, how many conflicts it
   **wins** and **loses**, and a status: *does nothing*, *mostly nothing (N%)*, *rule broken*,
   *disabled*, or *not in workshop.txt yet*.

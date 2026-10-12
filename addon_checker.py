@@ -264,8 +264,10 @@ def scan_folder_addon(addon, root):
         addon.errors.append("no readable content, unrecognized file format: " + ", ".join(details))
 
 
-def collect_addons(containers):
-    """Each container is a folder of addons (workshop/content/220 or a custom/ folder), or a single .vpk."""
+def collect_addons(containers, workshop_dirs=()):
+    """Each container is a folder of addons (workshop/content/220 or a custom/ folder), or a single .vpk.
+    workshop_dirs: containers to treat as Workshop folders even if they aren't named .../content/220."""
+    workshop_keys = {os.path.normcase(os.path.realpath(d)) for d in workshop_dirs}
     addons, seen = [], set()
     for container in containers:
         container = os.path.abspath(container)
@@ -285,7 +287,8 @@ def collect_addons(containers):
                 continue
             label = parent_name(container) + "/" + os.path.basename(container)
 
-        is_workshop = os.path.basename(container) == HL2_APPID and parent_name(container) == "content"
+        is_workshop = key in workshop_keys or (
+            os.path.basename(container) == HL2_APPID and parent_name(container) == "content")
         if is_workshop:
             label = "workshop"
         for path in entries:
@@ -308,8 +311,8 @@ def print_progress(i, total):
     print("\rReading addon %d/%d..." % (i, total), end="" if i < total else "\n", file=sys.stderr, flush=True)
 
 
-def scan(containers, progress=print_progress):
-    addons = collect_addons(containers)
+def scan(containers, progress=print_progress, workshop_dirs=()):
+    addons = collect_addons(containers, workshop_dirs)
     total = len(addons)
     for i, (addon, kind) in enumerate(addons, 1):
         progress(i, total)
@@ -423,6 +426,70 @@ def write_load_order(path, entries):
     with open(tmp, "w", encoding="utf-8", newline="\r\n" if sys.platform == "win32" else "\n") as f:
         f.write("\n".join(lines))
     os.replace(tmp, path)
+
+
+def resolve_game_dir(path):
+    """The Half-Life 2 folder, given it or a folder above it (a Steam library, steamapps, common)."""
+    if not path:
+        return None
+    for cand in (path, os.path.join(path, "Half-Life 2"), os.path.join(path, "common", "Half-Life 2"),
+                 os.path.join(path, "steamapps", "common", "Half-Life 2")):
+        if os.path.isdir(os.path.join(cand, "hl2_complete")) or os.path.isdir(os.path.join(cand, "hl2")):
+            return os.path.normpath(cand)
+    return None
+
+
+def resolve_workshop_dir(path):
+    """The workshop/content/220 folder, given it or a folder above it."""
+    if not path:
+        return None
+    for cand in (path, os.path.join(path, HL2_APPID), os.path.join(path, "content", HL2_APPID),
+                 os.path.join(path, "workshop", "content", HL2_APPID),
+                 os.path.join(path, "steamapps", "workshop", "content", HL2_APPID)):
+        if os.path.basename(os.path.normpath(cand)) == HL2_APPID and os.path.isdir(cand):
+            return os.path.normpath(cand)
+    return None
+
+
+def workshop_dir_for_game(game_dir):
+    """Steam keeps Workshop items in the same library as the game."""
+    steamapps = os.path.dirname(os.path.dirname(os.path.normpath(game_dir)))
+    path = os.path.join(steamapps, "workshop", "content", HL2_APPID)
+    return path if os.path.isdir(path) else None
+
+
+def game_dir_for_workshop(workshop_dir):
+    steamapps = os.path.dirname(os.path.dirname(os.path.dirname(os.path.normpath(workshop_dir))))
+    return resolve_game_dir(os.path.join(steamapps, "common", "Half-Life 2"))
+
+
+def find_hl2_dirs():
+    """(Half-Life 2 folder, Workshop folder) from Steam's libraries; either can be None."""
+    game = workshop = None
+    for root in steam_roots():
+        for lib in library_folders(root):
+            game = game or resolve_game_dir(os.path.join(lib, "steamapps", "common", "Half-Life 2"))
+            workshop = workshop or resolve_workshop_dir(os.path.join(lib, "steamapps", "workshop", "content", HL2_APPID))
+    if game and workshop_dir_for_game(game):
+        workshop = workshop_dir_for_game(game)
+    return game, workshop
+
+
+def game_folders(game_dir, workshop_dir):
+    """What to scan for a given game + Workshop folder, and where workshop.txt is.
+    Returns (containers, load order file or None)."""
+    containers = []
+    if workshop_dir:
+        containers.append(workshop_dir)
+    load_order = None
+    if game_dir:
+        for sub in sorted(os.listdir(game_dir)):
+            custom = os.path.join(game_dir, sub, "custom")
+            if os.path.isdir(custom):
+                containers.append(custom)
+        path = os.path.join(game_dir, "hl2_complete", "cfg", "workshop.txt")
+        load_order = path if os.path.isfile(path) else None
+    return containers, load_order
 
 
 def find_hl2_addon_folders():

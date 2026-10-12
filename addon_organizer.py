@@ -20,7 +20,7 @@ import threading
 import time
 import tkinter as tk
 from collections import defaultdict
-from tkinter import messagebox, ttk
+from tkinter import filedialog, messagebox, ttk
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import addon_checker as ac  # noqa: E402
@@ -75,6 +75,9 @@ class Organizer:
         self.order = []           # [[id, enabled]] as in workshop.txt, including uninstalled ids
         self.saved_order = []
         self.load_order_path = None
+        self.game_dir = None      # chosen in the Folders window; None = find automatically
+        self.workshop_dir = None
+        self.found_game = self.found_workshop = None  # what the last scan used
         self.leftovers = []
         self.rules = []           # [{"winner": id, "loser": id}]
         self.last_wins = tk.BooleanVar(value=False)
@@ -101,13 +104,16 @@ class Organizer:
                 data = json.load(f)
             self.rules = [r for r in data.get("rules", []) if r.get("winner") and r.get("loser")]
             self.last_wins.set(bool(data.get("last_wins", False)))
+            self.game_dir = data.get("game_dir") or None
+            self.workshop_dir = data.get("workshop_dir") or None
         except (OSError, ValueError):
             pass
 
     def save_settings(self):
         try:
             with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
-                json.dump({"last_wins": self.last_wins.get(), "rules": self.rules}, f, indent=2)
+                json.dump({"game_dir": self.game_dir, "workshop_dir": self.workshop_dir,
+                           "last_wins": self.last_wins.get(), "rules": self.rules}, f, indent=2)
         except OSError as e:
             messagebox.showerror("Couldn't save rules", "%s\n%s" % (SETTINGS_FILE, e))
 
@@ -124,6 +130,7 @@ class Organizer:
                    command=self.move_removable).pack(side="left", padx=4)
         ttk.Checkbutton(bar, text="Lower in the list wins", variable=self.last_wins).pack(side="left", padx=12)
         ttk.Button(bar, text="Rescan", command=self.start_scan).pack(side="right")
+        ttk.Button(bar, text="Folders...", command=self.choose_folders).pack(side="right", padx=4)
 
         panes = ttk.PanedWindow(self.root, orient="horizontal")
         panes.pack(fill="both", expand=True, padx=6, pady=6)
@@ -240,8 +247,8 @@ class Organizer:
 
     # ------------------------------------------------------------------ scanning
 
-    def start_scan(self):
-        if self.is_dirty() and not messagebox.askyesno(
+    def start_scan(self, confirm=True):
+        if confirm and self.is_dirty() and not messagebox.askyesno(
                 "Rescan", "Rescanning discards your unsaved load order changes. Continue?"):
             return
         self.status.config(text="Finding Half-Life 2...")
@@ -252,8 +259,15 @@ class Organizer:
         def progress(i, total):
             self.root.after(0, lambda: self.status.config(text="Reading addon %d of %d..." % (i, total)))
         try:
-            containers = ac.find_hl2_addon_folders()
-            addons = ac.scan(containers, progress) if containers else []
+            game = ac.resolve_game_dir(self.game_dir)
+            workshop = ac.resolve_workshop_dir(self.workshop_dir)
+            if not game and not workshop:
+                game, workshop = ac.find_hl2_dirs()
+            # One folder is enough to find the other in the same Steam library.
+            workshop = workshop or (game and ac.workshop_dir_for_game(game))
+            game = game or (workshop and ac.game_dir_for_workshop(workshop))
+            containers, path = ac.game_folders(game, workshop)
+            addons = ac.scan(containers, progress, workshop_dirs=[workshop] if workshop else []) if containers else []
             ids = {a.workshop_id for a in addons if a.workshop_id}
             if ids:
                 self.root.after(0, lambda: self.status.config(text="Looking up Workshop titles..."))
@@ -263,20 +277,24 @@ class Organizer:
                         a.name = titles[a.workshop_id]
                     elif a.workshop_id:
                         a.name = "Workshop item %s" % a.workshop_id
-            path = ac.find_load_order_file(containers)
             entries = ac.read_load_order(path) if path else []
         except Exception as e:  # report anything unexpected instead of dying silently
-            self.root.after(0, lambda: messagebox.showerror("Scan failed", str(e)))
+            message = str(e)
+            self.root.after(0, lambda: messagebox.showerror("Scan failed", message))
             return
-        self.root.after(0, lambda: self.scan_done(containers, addons, path, entries))
+        self.root.after(0, lambda: self.scan_done(game, workshop, addons, path, entries))
 
-    def scan_done(self, containers, addons, path, entries):
-        if not containers:
-            messagebox.showwarning("Half-Life 2 not found",
-                                   "Couldn't find Half-Life 2's Workshop folder (steamapps/workshop/content/220).")
-        if containers and not path:
+    def scan_done(self, game, workshop, addons, path, entries):
+        self.found_game, self.found_workshop = game, workshop
+        if not game or not workshop:
+            missing = [n for n, d in (("Half-Life 2", game), ("Workshop", workshop)) if not d]
+            text = ("Couldn't find the %s folder. Please choose it." % missing[0] if len(missing) == 1
+                    else "Couldn't find the Half-Life 2 and Workshop folders. Please choose them.")
+            self.root.after(100, lambda: self.choose_folders(text))
+        elif not path:
             messagebox.showwarning("No load order",
-                                   "Couldn't find hl2_complete/cfg/workshop.txt. Start the game once so it creates it.")
+                                   "Couldn't find hl2_complete/cfg/workshop.txt in\n%s\n\n"
+                                   "Start the game once so it creates it." % game)
         self.leftovers = [a for a in addons if a.leftover]
         self.addons = [a for a in addons if not a.leftover]
         self.by_id = {a.workshop_id: a for a in self.addons if a.workshop_id}
@@ -533,6 +551,88 @@ class Organizer:
         self.save_settings()
         if self.addons:
             self.recompute()
+
+    # ------------------------------------------------------------------ folders
+
+    def choose_folders(self, message=None):
+        win = tk.Toplevel(self.root)
+        win.title("Half-Life 2 folders")
+        win.transient(self.root)
+        win.resizable(True, False)
+        frame = ttk.Frame(win, padding=12)
+        frame.pack(fill="both", expand=True)
+        frame.columnconfigure(1, weight=1)
+
+        row = 0
+        if message:
+            ttk.Label(frame, text=message, foreground="#b00000").grid(row=0, column=0, columnspan=3, sticky="w",
+                                                                      pady=(0, 8))
+            row = 1
+        game = tk.StringVar(value=self.found_game or self.game_dir or "")
+        workshop = tk.StringVar(value=self.found_workshop or self.workshop_dir or "")
+
+        def browse(var, title):
+            start = var.get() if os.path.isdir(var.get()) else None
+            chosen = filedialog.askdirectory(parent=win, title=title, initialdir=start, mustexist=True)
+            if chosen:
+                var.set(os.path.normpath(chosen))
+                # Picking the game also finds its library's Workshop folder, if that's still empty.
+                if var is game and not workshop.get():
+                    g = ac.resolve_game_dir(var.get())
+                    workshop.set((g and ac.workshop_dir_for_game(g)) or "")
+                elif var is workshop and not game.get():
+                    w = ac.resolve_workshop_dir(var.get())
+                    game.set((w and ac.game_dir_for_workshop(w)) or "")
+
+        for label, var, hint in [
+                ("Half-Life 2 folder", game, r"e.g. D:\SteamLibrary\steamapps\common\Half-Life 2"),
+                ("Workshop folder", workshop, r"e.g. D:\SteamLibrary\steamapps\workshop\content\220")]:
+            ttk.Label(frame, text=label).grid(row=row, column=0, sticky="w", padx=(0, 8))
+            ttk.Entry(frame, textvariable=var, width=70).grid(row=row, column=1, sticky="ew")
+            ttk.Button(frame, text="Browse...", command=lambda v=var, t=label: browse(v, "Choose the " + t)
+                       ).grid(row=row, column=2, padx=(6, 0))
+            ttk.Label(frame, text=hint, foreground="#777777").grid(row=row + 1, column=1, sticky="w", pady=(0, 8))
+            row += 2
+
+        def detect():
+            g, w = ac.find_hl2_dirs()
+            game.set(g or "")
+            workshop.set(w or "")
+            if not g or not w:
+                messagebox.showinfo("Detect", "Steam didn't say where %s is. Please browse to it." %
+                                    " and ".join(n for n, d in (("Half-Life 2", g), ("the Workshop folder", w))
+                                                 if not d), parent=win)
+
+        def ok():
+            g = ac.resolve_game_dir(game.get().strip())
+            w = ac.resolve_workshop_dir(workshop.get().strip())
+            problems = []
+            if game.get().strip() and not g:
+                problems.append("The Half-Life 2 folder should contain hl2 and hl2_complete.")
+            if workshop.get().strip() and not w:
+                problems.append("The Workshop folder should be steamapps\\workshop\\content\\220.")
+            if not g and not w:
+                problems.append("Choose at least one folder.")
+            if problems:
+                messagebox.showerror("Folders", "\n".join(problems), parent=win)
+                return
+            if self.is_dirty() and not messagebox.askyesno(
+                    "Folders", "Rescanning discards your unsaved load order changes. Continue?", parent=win):
+                return
+            self.game_dir, self.workshop_dir = g, w
+            self.save_settings()
+            win.destroy()
+            self.start_scan(confirm=False)
+
+        buttons = ttk.Frame(frame)
+        buttons.grid(row=row, column=0, columnspan=3, sticky="ew", pady=(4, 0))
+        ttk.Button(buttons, text="Detect automatically", command=detect).pack(side="left")
+        ttk.Button(buttons, text="Cancel", command=win.destroy).pack(side="right")
+        ttk.Button(buttons, text="OK", command=ok).pack(side="right", padx=6)
+        win.bind("<Return>", lambda e: ok())
+        win.bind("<Escape>", lambda e: win.destroy())
+        win.grab_set()
+        return win
 
     # ------------------------------------------------------------------ saving
 
