@@ -43,6 +43,7 @@ Use `--offline` to skip that and show item IDs instead.
 | `--offline` | Don't look up Workshop titles |
 | `--load-order FILE` | The game's `workshop.txt`, if it isn't found automatically |
 | `--last-wins` | The addon lower in `workshop.txt` wins conflicts |
+| `--find TEXT` | Only list files matching `TEXT` (e.g. `d1_town_02`, `maps/d1_town_*`) and what each addon does with them |
 | `--all` | Also check disabled addons and ones missing from `workshop.txt` |
 
 The exit code is 2 when conflicts were found and 0 when none were.
@@ -75,6 +76,12 @@ folder; tkinter comes with the python.org installer on Windows.
 - **Move removable addons to the losing end:** moves every addon that does nothing to the end of
   the list where it loses. The game plays the same, and they end up together in the game's
   Add-ons screen for unsubscribing.
+- **Find file tab:** type part of a path (a map name like `d1_town_02`, or a pattern like
+  `maps/d1_town_*`) to see every matching file any addon has, and for each one which addon's copy
+  the game uses, which are overwritten, disabled or identical, and whether it's the original file.
+  A map name also finds its companion files (`maps/graphs/*.ain` node graphs, `_l_0.lmp` lighting
+  patches, map materials), which are a common cause of map bugs when they come from a different
+  addon than the `.bsp`. Double-click an addon to jump to it.
 - **Files tab:** every file in the addon and whether the game uses it, or which addon overwrites it.
 - **Lower in the list wins:** flips the assumed load order direction (saved with your rules).
 - **Save load order** writes `workshop.txt`, after backing the old one up as

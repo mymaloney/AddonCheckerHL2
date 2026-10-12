@@ -86,6 +86,8 @@ class Organizer:
         self.rules = []           # [{"winner": id, "loser": id}]
         self.last_wins = tk.BooleanVar(value=False)
         self.filter_text = tk.StringVar()
+        self.find_text = tk.StringVar()
+        self.find_rows = {}       # result row id -> Addon, for jumping to it
         self.selected = None      # Addon shown on the right
         self.backup_done = False
         self.removable = set()
@@ -234,6 +236,36 @@ class Organizer:
         fs.pack(side="right", fill="y")
         self.files_tree.pack(side="left", fill="both", expand=True)
 
+        # Find file tab: which addons change a file, e.g. every file of one map
+        find = ttk.Frame(self.tabs)
+        self.tabs.add(find, text="Find file")
+        self.find_tab = find
+        top = ttk.Frame(find)
+        top.pack(fill="x", pady=(4, 2))
+        ttk.Label(top, text="File:").pack(side="left")
+        entry = ttk.Entry(top, textvariable=self.find_text)
+        entry.pack(side="left", fill="x", expand=True, padx=4)
+        entry.bind("<Return>", lambda e: self.run_find())
+        ttk.Button(top, text="Search", command=self.run_find).pack(side="left")
+        ttk.Label(find, text="Part of a path, e.g. a map name like d1_town_02, or a pattern like maps/d1_town_*",
+                  foreground="#777777").pack(anchor="w")
+        self.find_tree = ttk.Treeview(find, columns=("pos", "state"), show="tree headings", selectmode="browse")
+        self.find_tree.heading("#0", text="File / addon")
+        self.find_tree.heading("pos", text="#")
+        self.find_tree.heading("state", text="In game")
+        self.find_tree.column("#0", width=250, minwidth=120)
+        self.find_tree.column("pos", width=36, anchor="e", stretch=False)
+        self.find_tree.column("state", width=200, minwidth=120)
+        self.find_tree.tag_configure("used", foreground="#006400")
+        self.find_tree.tag_configure("inactive", foreground=STATUS_COLORS["disabled"])
+        self.find_tree.tag_configure("severe", foreground="#b00000")
+        self.find_tree.tag_configure("note", foreground="#777777")
+        ns = ttk.Scrollbar(find, orient="vertical", command=self.find_tree.yview)
+        self.find_tree.configure(yscrollcommand=ns.set)
+        ns.pack(side="right", fill="y")
+        self.find_tree.pack(side="left", fill="both", expand=True)
+        self.find_tree.bind("<Double-1>", self.jump_from_find)
+
         # Rules tab
         rules = ttk.Frame(self.tabs)
         self.tabs.add(rules, text="All rules")
@@ -359,6 +391,8 @@ class Organizer:
         self.refresh_details()
         self.refresh_rules()
         self.refresh_status()
+        if self.find_text.get().strip():
+            self.run_find()  # the order changed, so which copy is used may have too
 
     def rule_broken(self, rule):
         a, b = self.by_id.get(rule["winner"]), self.by_id.get(rule["loser"])
@@ -871,6 +905,46 @@ class Organizer:
             self.rules = [r for n, r in enumerate(self.rules) if n not in drop]
             self.save_settings()
             self.recompute()
+
+    def run_find(self):
+        query = self.find_text.get().strip()
+        open_paths = {self.find_tree.item(i, "text") for i in self.find_tree.get_children()
+                      if self.find_tree.item(i, "open")}
+        self.find_tree.delete(*self.find_tree.get_children())
+        self.find_rows = {}
+        if not query:
+            return
+        self.tabs.select(self.find_tab)
+        results, total = ac.find_files(query, self.addons, self.by_path, self.base)
+        if not results:
+            self.find_tree.insert("", "end", text="No addon has a file matching \"%s\"" % query, tags=("note",))
+            return
+        expand = len(results) <= 20
+        for path, summary, rows in results:
+            node = self.find_tree.insert("", "end", text=path, values=("", summary),
+                                         open=expand or path in open_paths,
+                                         tags=("severe",) if ac.severity(path) == 2 else ())
+            for a, status in rows:
+                tags = ("used",) if status.startswith("USED") else (
+                    ("inactive",) if status.startswith(("disabled", "not loaded")) else ())
+                row = self.find_tree.insert(node, "end", text=a.name if a else self.base_addon.name,
+                                            values=(a.position or "" if a else "", status),
+                                            tags=tags if a else ("note",))
+                if a:
+                    self.find_rows[row] = a
+        if total > len(results):
+            self.find_tree.insert("", "end", text="... and %d more files: type more of the name" % (total - len(results)),
+                                  tags=("note",))
+
+    def jump_from_find(self, event):
+        a = self.find_rows.get(self.find_tree.focus())
+        if a and self.tree.exists(self.addon_key(a)):
+            self.filter_text.set("")
+            key = self.addon_key(a)
+            self.tree.selection_set(key)
+            self.tree.see(key)
+            self.tabs.select(self.find_tab)  # stay on the search results
+        return "break"
 
     def jump_to_other(self, event):
         other = self.selected_other()

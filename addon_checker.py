@@ -15,6 +15,7 @@ No third-party packages needed; Python 3.7 or newer.
 
 import argparse
 import bz2
+import fnmatch
 import gzip
 import json
 import lzma
@@ -732,6 +733,65 @@ def analyze(addons, min_dupe_size, base=None):
     return conflicts, same_path, content_dupes, pairs, removed, idle, base_copies, base
 
 
+def path_matcher(query):
+    """Case-insensitive part of a path, or a wildcard pattern like maps/d1_town_*."""
+    q = norm(query)
+    if any(ch in q for ch in "*?["):
+        return lambda p: fnmatch.fnmatchcase(p, q) or fnmatch.fnmatchcase(p, "*" + q + "*")
+    return lambda p: q in p
+
+
+def find_files(query, addons, by_path, base=None, limit=500):
+    """
+    Every file matching query that some addon has, and what each addon does with it.
+    addons: every addon to search, loaded or not; by_path: index of the loaded ones.
+    Returns ([(path, summary, [(addon or None for the base game, status)])], number of matching paths).
+    """
+    base = base or {}
+    match = path_matcher(query)
+    found = defaultdict(list)
+    for a in addons:
+        for p in a.files:
+            if match(p):
+                found[p].append(a)
+    paths = sorted(found)
+    results = []
+    for p in paths[:limit]:
+        loaded = by_path.get(p, [])
+        loaded_set = {c[0] for c in loaded}
+        ranked = by_rank(loaded)
+        winner = ranked[0] if loaded and known(*(c[0] for c in loaded)) else None
+        not_loaded = sorted((a for a in found[p] if a not in loaded_set), key=lambda a: a.name.lower())
+        rows = []
+        for a in [c[0] for c in ranked] + not_loaded:
+            content = a.files[p]
+            if a not in loaded_set:
+                status = "disabled" if a.position else "not loaded"
+            elif winner is None:
+                status = "load order unknown"
+            elif a is winner[0]:
+                status = "USED"
+            elif content == (winner[1], winner[2]):
+                status = "identical to the used copy"
+            else:
+                status = "overwritten"
+            if base.get(p) == content:
+                status += ", same as the original"
+            rows.append((a, status))
+        if p in base:
+            rows.append((None, "original game file" + (", used (no loaded addon has it)" if not loaded else "")))
+        if winner:
+            summary = "used: " + winner[0].name
+            if base.get(p) == (winner[1], winner[2]):
+                summary += " (same as the original)"
+        elif loaded:
+            summary = "load order unknown"
+        else:
+            summary = "no loaded addon has it"
+        results.append((p, summary, rows))
+    return results, len(paths)
+
+
 def nice_size(n):
     if n >= 1024 * 1024:
         return "%.1f MB" % (n / 1048576)
@@ -957,6 +1017,8 @@ def main():
     ap.add_argument("--game-dir", metavar="FOLDER",
                     help="the Half-Life 2 folder, for comparing addons with the base game (default: found automatically)")
     ap.add_argument("--no-base-game", action="store_true", help="don't compare addons with the base game's files")
+    ap.add_argument("--find", metavar="TEXT",
+                    help="list the files matching TEXT (e.g. d1_town_02 or maps/d1_town_*) and which addons change them")
     ap.add_argument("--all", action="store_true",
                     help="also check disabled addons and ones missing from workshop.txt")
     args = ap.parse_args()
@@ -1039,6 +1101,21 @@ def main():
                 base_info = "no VPKs found in %s, so files weren't compared with it" % game
             for e in errors:
                 print("Base game: " + e, file=sys.stderr)
+
+    if args.find:
+        everything = addons + [a for _, items, _ in skipped[:2] if not args.all for a in items]
+        results, total = find_files(args.find, everything, index_files(addons), base, limit=args.limit or 10 ** 9)
+        if not results:
+            print("No addon has a file matching %r." % args.find)
+        for path, summary, rows in results:
+            print("%s%s" % ("[!] " if severity(path) == 2 else "", path))
+            print("    " + summary)
+            for a, status in rows:
+                pos = ("#%d" % a.position) if a and a.position else "-"
+                print("    %5s  %-50s  %s" % (pos, a.name if a else "Half-Life 2 (original game files)", status))
+        if total > len(results):
+            print("... and %d more files (use --limit 0 to see all)" % (total - len(results)))
+        return 0
 
     analysis = analyze(addons, args.min_dupe_size, base)
     with open(args.out, "w", encoding="utf-8") as f:
