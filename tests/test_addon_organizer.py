@@ -613,15 +613,18 @@ class OrganizerTest(unittest.TestCase):
         self.assertFalse(app.find_tree.item(node, "open"))
 
     def test_window_saved_on_a_missing_monitor(self):  # ui-11
+        # The size the window gets for this geometry on screen; the screen (Windows shrinks a window
+        # wider than the screen) and the window's minimum size can change it, so compare with it.
+        self.open(settings={"geometry": "1100x650+40+30"})
+        self.pump(20)
+        self.assertLessEqual(abs(self.root.winfo_x() - 40), 10)
+        width = self.root.winfo_width()
+        self.close()
         self.open(settings={"geometry": "1100x650+3000+2500"})
         self.pump(20)
         self.assertLess(self.root.winfo_x(), self.root.winfo_screenwidth() - 100)
         self.assertLess(self.root.winfo_y(), self.root.winfo_screenheight() - 50)
-        self.assertEqual(self.root.winfo_width(), 1100)
-        self.close()
-        self.open(settings={"geometry": "1100x650+40+30"})
-        self.pump(20)
-        self.assertLessEqual(abs(self.root.winfo_x() - 40), 10)
+        self.assertEqual(self.root.winfo_width(), width)
 
     # ---------------------------------------------------------------- tools
 
