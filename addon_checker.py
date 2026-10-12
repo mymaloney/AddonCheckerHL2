@@ -602,10 +602,14 @@ def _fetch_titles(ids, titles):
 FALLBACK_GAME_FOLDERS = ["hl2_complete", "ep2", "episodic", "hl2", "lostcoast", "platform"]
 
 
-def gameinfo_search_paths(game_dir):
-    """gameinfo.txt's SearchPaths, highest priority first: ([(keys, path)], gameinfo.txt path or None).
-    Paths are resolved to full paths; a trailing "*" (e.g. custom/*) is kept."""
-    for folder in ("hl2_complete", "hl2"):
+GAMEINFO_FOLDERS = ("hl2_complete", "hl2")
+
+
+def gameinfo_search_paths(game_dir, folders=GAMEINFO_FOLDERS):
+    """SearchPaths of the first readable gameinfo.txt in folders, highest priority first:
+    ([(keys, path)], gameinfo.txt path or None). Paths are resolved to full paths; a trailing
+    "*" (e.g. custom/*) is kept."""
+    for folder in folders:
         gameinfo = os.path.join(game_dir, folder, "gameinfo.txt")
         try:
             with open(gameinfo, encoding="utf-8-sig", errors="replace") as f:
@@ -632,17 +636,20 @@ def gameinfo_search_paths(game_dir):
 def gameinfo_vpks(game_dir):
     """The VPKs the game mounts, highest priority first, read from gameinfo.txt's SearchPaths.
     Returns (list of _dir.vpk / .vpk paths, gameinfo.txt path or None)."""
-    paths, gameinfo = gameinfo_search_paths(game_dir)
-    vpks = []
-    for _, path in paths:
-        if not path.lower().endswith(".vpk") or "*" in path:
-            continue
-        # "hl2/hl2_pak.vpk" in gameinfo means hl2/hl2_pak_dir.vpk on disk.
-        for cand in (path[:-4] + "_dir.vpk", path):
-            if os.path.isfile(cand) and cand not in vpks:
-                vpks.append(cand)
-                break
-    return (vpks, gameinfo) if vpks else ([], None)
+    for folder in GAMEINFO_FOLDERS:
+        paths, gameinfo = gameinfo_search_paths(game_dir, (folder,))
+        vpks = []
+        for _, path in paths:
+            if not path.lower().endswith(".vpk") or "*" in path:
+                continue
+            # "hl2/hl2_pak.vpk" in gameinfo means hl2/hl2_pak_dir.vpk on disk.
+            for cand in (path[:-4] + "_dir.vpk", path):
+                if os.path.isfile(cand) and cand not in vpks:
+                    vpks.append(cand)
+                    break
+        if vpks:
+            return vpks, gameinfo
+    return [], None
 
 
 # Used when gameinfo.txt can't be read: the custom folders Half-Life 2 and its episodes mount.
@@ -1136,15 +1143,12 @@ def analyze(addons, min_dupe_size, base=None, loaded=None):
                     losers.append(c[0])
             pairs_here = [(winner[0], loser) for loser in losers]
         else:
-            pairs_here = []
+            pairs_here = set()
             for i in range(len(copies)):
                 for j in range(i + 1, len(copies)):
                     a, b = copies[i], copies[j]
-                    if (a[1], a[2]) == (b[1], b[2]) or a[0] is b[0]:
-                        continue
-                    pair = (a[0], b[0]) if a[0].name.lower() <= b[0].name.lower() else (b[0], a[0])
-                    if pair not in pairs_here:
-                        pairs_here.append(pair)
+                    if (a[1], a[2]) != (b[1], b[2]) and a[0] is not b[0]:
+                        pairs_here.add((a[0], b[0]) if a[0].name.lower() <= b[0].name.lower() else (b[0], a[0]))
         for pair in pairs_here:
             counts = pair_counts[pair]
             counts[0] += 1
