@@ -51,6 +51,12 @@ class Addon:
     workshop_id: str = ""
     files: dict = field(default_factory=dict)  # path -> (size, crc32)
     errors: list = field(default_factory=list)
+    leftover: bool = False  # folder only holds cache files: the addon was removed
+
+
+def is_cache(name):
+    """Caches the game generates (workshop.vpk.sound.cache, sound/sound.cache) aren't addon content."""
+    return name.lower().endswith(".cache")
 
 
 def norm(path):
@@ -226,6 +232,8 @@ def scan_folder_addon(addon, root):
             # Loose content: materials/, models/, sound/...
             for dirpath, _, names in os.walk(entry.path):
                 for name in names:
+                    if is_cache(name):
+                        continue
                     full = os.path.join(dirpath, name)
                     rel = norm(os.path.relpath(full, root))
                     try:
@@ -233,13 +241,17 @@ def scan_folder_addon(addon, root):
                     except OSError as e:
                         addon.errors.append("can't read %s: %s" % (rel, e.strerror))
         elif entry.is_file():
-            if VPK_ARCHIVE_PART.search(entry.name):
+            if VPK_ARCHIVE_PART.search(entry.name) or is_cache(entry.name):
                 continue
             try:
                 if not read_packed_file(addon, entry.path):
                     unknown.append(entry)
             except READ_ERRORS as e:
                 addon.errors.append("%s: %s" % (entry.name, e))
+
+    # Removing a Workshop addon deletes its VPK but leaves the game's cache file behind.
+    if not addon.files and not addon.errors and not unknown:
+        addon.leftover = True
 
     # Root files like addoninfo.txt are normal. Only worth mentioning if nothing else was readable.
     if not addon.files and not addon.errors and unknown:
@@ -303,8 +315,8 @@ def scan(containers):
                     addon.errors.append("not a VPK file")
             except READ_ERRORS as e:
                 addon.errors.append(str(e))
-        # Files at the addon root (addoninfo.txt...) aren't game content.
-        addon.files = {p: v for p, v in addon.files.items() if "/" in p}
+        # Files at the addon root (addoninfo.txt...) and caches aren't game content.
+        addon.files = {p: v for p, v in addon.files.items() if "/" in p and not is_cache(p)}
     if total:
         print(file=sys.stderr)
     return [a for a, _ in addons]
@@ -433,7 +445,18 @@ def analyze(addons, min_dupe_size):
                      if len(group) > 1 and len({id(a) for _, a in group}) > 1]
     content_dupes.sort(key=lambda item: (-item[0], item[1][0][0]))
 
-    return conflicts, same_path, content_dupes, severity
+    # Which addons fight the most: [files in conflict, of which [!]] per pair.
+    pair_counts = defaultdict(lambda: [0, 0])
+    for path, copies in conflicts:
+        owners = sorted({a.name for a, _, _ in copies}, key=str.lower)
+        for i in range(len(owners)):
+            for j in range(i + 1, len(owners)):
+                counts = pair_counts[(owners[i], owners[j])]
+                counts[0] += 1
+                counts[1] += severity(path) == 2
+    pairs = sorted(pair_counts.items(), key=lambda item: (-item[1][0], item[0]))
+
+    return conflicts, same_path, content_dupes, severity, pairs
 
 
 def nice_size(n):
@@ -444,8 +467,8 @@ def nice_size(n):
     return "%d bytes" % n
 
 
-def format_report(addons, containers, analysis, limit):
-    conflicts, same_path, content_dupes, severity = analysis
+def format_report(addons, leftovers, containers, analysis, limit):
+    conflicts, same_path, content_dupes, severity, pairs = analysis
     out = []
     w = out.append
 
@@ -453,6 +476,8 @@ def format_report(addons, containers, analysis, limit):
     w("HL2 Addon Checker: %d addons, %d files" % (len(addons), total_files))
     w("%d conflicts, %d same-path duplicates, %d content duplicates"
       % (len(conflicts), len(same_path), len(content_dupes)))
+    if leftovers:
+        w("%d leftover folders from removed addons were skipped (listed at the end)" % len(leftovers))
     w("")
     w("Scanned:")
     for c in containers:
@@ -473,6 +498,17 @@ def format_report(addons, containers, analysis, limit):
             for e in a.errors[:5]:
                 w("      " + e)
         w("")
+
+    w("== ADDON PAIRS WITH THE MOST CONFLICTS (%d) ==" % len(pairs))
+    w("Start here: each pair overwrites this many of each other's files.")
+    w("")
+    for i, ((a, b), (count, severe)) in enumerate(pairs):
+        if more(i, pairs):
+            break
+        w("  %5d file%s%s" % (count, "" if count == 1 else "s", "  (%d [!])" % severe if severe else ""))
+        w("      " + a)
+        w("      " + b)
+    w("")
 
     w("== CONFLICTS (%d) ==" % len(conflicts))
     w("Same file, different contents. The game only uses one copy, so the other")
@@ -510,6 +546,17 @@ def format_report(addons, containers, analysis, limit):
         for path, addon in group:
             w("      %s  [%s]" % (path, addon.name))
 
+    if leftovers:
+        w("")
+        w("== LEFTOVER FOLDERS (%d) ==" % len(leftovers))
+        w("These only hold cache files, left behind by addons you removed.")
+        w("They're skipped, and safe to delete.")
+        w("")
+        for i, a in enumerate(leftovers):
+            if more(i, leftovers):
+                break
+            w("  %s\n      %s" % (a.name, a.location))
+
     return "\n".join(out) + "\n"
 
 
@@ -544,11 +591,14 @@ def main():
             if a.workshop_id in titles:
                 a.name = "%s [workshop %s]" % (titles[a.workshop_id], a.workshop_id)
 
+    leftovers = [a for a in addons if a.leftover]
+    addons = [a for a in addons if not a.leftover]
+
     analysis = analyze(addons, args.min_dupe_size)
     with open(args.out, "w", encoding="utf-8") as f:
-        f.write(format_report(addons, containers, analysis, 0))
+        f.write(format_report(addons, leftovers, containers, analysis, 0))
 
-    print(format_report(addons, containers, analysis, args.limit))
+    print(format_report(addons, leftovers, containers, analysis, args.limit))
     print("Full report: " + os.path.abspath(args.out))
 
     if pause:
