@@ -855,7 +855,7 @@ class Organizer:
             active.append(a)
 
         self.by_path = ac.index_files(active)
-        self.removable, idle = ac.find_idle_addons(active, self.by_path, self.base)
+        self.removable, idle, self.together = ac.find_idle_addons(active, self.by_path, self.base)
         self.idle = {e[0]: e for e in idle}
 
         # Per addon: files where it beats / loses to a different copy.
