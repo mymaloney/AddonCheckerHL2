@@ -43,3 +43,4 @@ luac.out
 # Standalone checker build
 /addon_checker
 addon_report.txt
+__pycache__/

@@ -1,0 +1,560 @@
+#!/usr/bin/env python3
+"""
+HL2 Addon Checker
+
+Finds Half-Life 2 addons that overwrite each other's files, and addons that
+ship duplicate copies of the same file. Scans Steam Workshop items
+(steamapps/workshop/content/220) and custom/ folders.
+
+    python addon_checker.py                  find Steam + Half-Life 2 automatically
+    python addon_checker.py FOLDER [...]     scan folders that contain addons
+    python addon_checker.py --help           all options
+
+No third-party packages needed; Python 3.7 or newer.
+"""
+
+import argparse
+import bz2
+import gzip
+import json
+import lzma
+import os
+import re
+import struct
+import sys
+import urllib.parse
+import urllib.request
+import zipfile
+import zlib
+from collections import defaultdict
+from dataclasses import dataclass, field
+
+HL2_APPID = "220"
+VPK_MAGIC = struct.pack("<I", 0x55AA1234)
+VPK_ARCHIVE_PART = re.compile(r"_\d{3}\.vpk$", re.IGNORECASE)  # foo_000.vpk holds data for foo_dir.vpk
+
+# Conflicts here replace weapon/sound scripts, UI or maps: most likely to break the game.
+SEVERE_DIRS = ("scripts/", "resource/", "cfg/", "maps/")
+
+
+class BadAddon(Exception):
+    pass
+
+
+READ_ERRORS = (BadAddon, OSError, EOFError, lzma.LZMAError, zlib.error, zipfile.BadZipFile)
+
+
+@dataclass
+class Addon:
+    name: str
+    location: str
+    workshop_id: str = ""
+    files: dict = field(default_factory=dict)  # path -> (size, crc32)
+    errors: list = field(default_factory=list)
+
+
+def norm(path):
+    """Source paths are case-insensitive and use either slash."""
+    return path.replace("\\", "/").strip("/").lower()
+
+
+# ---------------------------------------------------------------------------
+# Opening (possibly compressed) VPKs
+# ---------------------------------------------------------------------------
+
+class ZlibReader:
+    """Minimal streaming reader for raw zlib data, which has no file wrapper in the stdlib."""
+
+    def __init__(self, f):
+        self.f = f
+        self.dec = zlib.decompressobj()
+        self.buf = b""
+
+    def read(self, n):
+        while len(self.buf) < n and not self.dec.eof:
+            chunk = self.f.read(64 * 1024)
+            if not chunk:
+                break
+            self.buf += self.dec.decompress(chunk)
+        out, self.buf = self.buf[:n], self.buf[n:]
+        return out
+
+    def close(self):
+        self.f.close()
+
+
+def _valve_lzma(path):
+    # Valve's own header: "LZMA", uncompressed size, compressed size, 5 LZMA property bytes
+    f = open(path, "rb")
+    head = f.read(17)
+    props, dict_size = head[12], struct.unpack_from("<I", head, 13)[0]
+    lc, props = props % 9, props // 9
+    lp, pb = props % 5, props // 5
+    filt = {"id": lzma.FILTER_LZMA1, "dict_size": dict_size, "lc": lc, "lp": lp, "pb": pb}
+    return lzma.open(f, format=lzma.FORMAT_RAW, filters=[filt])
+
+
+# (name, test on the first bytes, opener). Every candidate must also decompress to a VPK header.
+OPENERS = [
+    ("VPK", lambda h: h[:4] == VPK_MAGIC, lambda p: open(p, "rb")),
+    ("Valve LZMA", lambda h: h[:4] == b"LZMA" and len(h) >= 17, _valve_lzma),
+    ("xz", lambda h: h[:6] == b"\xfd7zXZ\x00", lambda p: lzma.open(p, format=lzma.FORMAT_XZ)),
+    ("gzip", lambda h: h[:2] == b"\x1f\x8b", lambda p: gzip.open(p, "rb")),
+    ("bzip2", lambda h: h[:3] == b"BZh", lambda p: bz2.open(p, "rb")),
+    ("zlib", lambda h: len(h) >= 2 and h[0] & 0x0F == 8 and (h[0] << 8 | h[1]) % 31 == 0,
+     lambda p: ZlibReader(open(p, "rb"))),
+    ("LZMA", lambda h: len(h) >= 13 and h[0] < 225, lambda p: lzma.open(p, format=lzma.FORMAT_ALONE)),
+]
+
+
+def read_exact(stream, n):
+    data = stream.read(n)
+    if len(data) != n:
+        raise BadAddon("file is truncated")
+    return data
+
+
+def detect_vpk(path):
+    """Returns the opener for this file if it is a (compressed) VPK, else None."""
+    with open(path, "rb") as f:
+        head = f.read(32)
+    for _, test, opener in OPENERS:
+        if not test(head):
+            continue
+        try:
+            s = opener(path)
+            try:
+                if s.read(4) == VPK_MAGIC:
+                    return opener
+            finally:
+                s.close()
+        except (OSError, EOFError, lzma.LZMAError, zlib.error, ValueError):
+            pass
+    return None
+
+
+def parse_vpk(stream, files, magic_read=False):
+    """Reads a VPK's directory tree (v1 or v2) into files. Only the tree is read, not the data."""
+    if not magic_read and read_exact(stream, 4) != VPK_MAGIC:
+        raise BadAddon("not a VPK file")
+    version, tree_size = struct.unpack("<II", read_exact(stream, 8))
+    if version == 2:
+        read_exact(stream, 16)  # section sizes we don't need
+    elif version != 1:
+        raise BadAddon("unsupported VPK version %d" % version)
+    tree = read_exact(stream, tree_size)
+
+    pos = 0
+
+    def string():
+        nonlocal pos
+        end = tree.find(b"\0", pos)
+        if end < 0:
+            raise BadAddon("corrupt VPK directory")
+        s = tree[pos:end].decode("utf-8", "replace")
+        pos = end + 1
+        return s
+
+    # extension -> directory -> name -> entry; each list ends with "". " " means none/root.
+    while True:
+        ext = string()
+        if not ext:
+            break
+        while True:
+            directory = string()
+            if not directory:
+                break
+            while True:
+                name = string()
+                if not name:
+                    break
+                if pos + 18 > len(tree):
+                    raise BadAddon("corrupt VPK directory")
+                crc, preload, _archive, _offset, length, _end = struct.unpack_from("<IHHIIH", tree, pos)
+                pos += 18 + preload
+                path = name if directory == " " else directory + "/" + name
+                if ext != " ":
+                    path += "." + ext
+                files.setdefault(norm(path), (preload + length, crc))
+
+
+def read_packed_file(addon, path):
+    """Adds a (compressed) VPK or a zip of VPKs to the addon. Returns False if it's neither."""
+    if zipfile.is_zipfile(path):
+        found = False
+        with zipfile.ZipFile(path) as z:
+            for member in z.namelist():
+                if VPK_ARCHIVE_PART.search(member):
+                    continue
+                with z.open(member) as s:
+                    if s.read(4) == VPK_MAGIC:
+                        parse_vpk(s, addon.files, magic_read=True)
+                        found = True
+        return found
+
+    opener = detect_vpk(path)
+    if not opener:
+        return False
+    s = opener(path)
+    try:
+        parse_vpk(s, addon.files)
+    finally:
+        s.close()
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Scanning addons
+# ---------------------------------------------------------------------------
+
+def crc_file(path):
+    crc, size = 0, 0
+    with open(path, "rb") as f:
+        while True:
+            chunk = f.read(1024 * 1024)
+            if not chunk:
+                break
+            crc = zlib.crc32(chunk, crc)  # same CRC32 VPK directories store
+            size += len(chunk)
+    return size, crc & 0xFFFFFFFF
+
+
+def scan_folder_addon(addon, root):
+    unknown = []
+    for entry in sorted(os.scandir(root), key=lambda e: e.name.lower()):
+        if entry.is_dir():
+            # Loose content: materials/, models/, sound/...
+            for dirpath, _, names in os.walk(entry.path):
+                for name in names:
+                    full = os.path.join(dirpath, name)
+                    rel = norm(os.path.relpath(full, root))
+                    try:
+                        addon.files.setdefault(rel, crc_file(full))
+                    except OSError as e:
+                        addon.errors.append("can't read %s: %s" % (rel, e.strerror))
+        elif entry.is_file():
+            if VPK_ARCHIVE_PART.search(entry.name):
+                continue
+            try:
+                if not read_packed_file(addon, entry.path):
+                    unknown.append(entry)
+            except READ_ERRORS as e:
+                addon.errors.append("%s: %s" % (entry.name, e))
+
+    # Root files like addoninfo.txt are normal. Only worth mentioning if nothing else was readable.
+    if not addon.files and not addon.errors and unknown:
+        details = []
+        for e in unknown[:3]:
+            with open(e.path, "rb") as f:
+                details.append("%s (starts with %s)" % (e.name, f.read(8).hex(" ")))
+        addon.errors.append("no readable content, unrecognized file format: " + ", ".join(details))
+
+
+def collect_addons(containers):
+    """Each container is a folder of addons (workshop/content/220 or a custom/ folder), or a single .vpk."""
+    addons, seen = [], set()
+    for container in containers:
+        container = os.path.abspath(container)
+        key = os.path.normcase(os.path.realpath(container))
+        if key in seen:
+            continue
+        seen.add(key)
+
+        if os.path.isfile(container):
+            entries = [container]
+            label = os.path.basename(os.path.dirname(container))
+        else:
+            try:
+                entries = sorted((os.path.join(container, n) for n in os.listdir(container)), key=str.lower)
+            except OSError as e:
+                print("Can't open %s: %s" % (container, e.strerror), file=sys.stderr)
+                continue
+            label = parent_name(container) + "/" + os.path.basename(container)
+
+        is_workshop = os.path.basename(container) == HL2_APPID and parent_name(container) == "content"
+        if is_workshop:
+            label = "workshop"
+        for path in entries:
+            name = os.path.basename(path)
+            if os.path.isdir(path):
+                addon = Addon(name=label + "/" + name, location=path)
+                if is_workshop and name.isdigit():
+                    addon.workshop_id = name
+                addons.append((addon, "folder"))
+            elif name.lower().endswith(".vpk") and not VPK_ARCHIVE_PART.search(name):
+                addons.append((Addon(name=label + "/" + name, location=path), "vpk"))
+    return addons
+
+
+def parent_name(path):
+    return os.path.basename(os.path.dirname(path))
+
+
+def scan(containers):
+    addons = collect_addons(containers)
+    total = len(addons)
+    for i, (addon, kind) in enumerate(addons, 1):
+        print("\rReading addon %d/%d..." % (i, total), end="", file=sys.stderr, flush=True)
+        if kind == "folder":
+            scan_folder_addon(addon, addon.location)
+        else:
+            try:
+                if not read_packed_file(addon, addon.location):
+                    addon.errors.append("not a VPK file")
+            except READ_ERRORS as e:
+                addon.errors.append(str(e))
+        # Files at the addon root (addoninfo.txt...) aren't game content.
+        addon.files = {p: v for p, v in addon.files.items() if "/" in p}
+    if total:
+        print(file=sys.stderr)
+    return [a for a, _ in addons]
+
+
+# ---------------------------------------------------------------------------
+# Workshop titles
+# ---------------------------------------------------------------------------
+
+def fetch_workshop_titles(ids):
+    """Looks up item titles with Steam's public API. Returns {} if offline."""
+    titles = {}
+    ids = sorted(ids)
+    for start in range(0, len(ids), 100):
+        batch = ids[start:start + 100]
+        data = {"itemcount": len(batch)}
+        for i, wsid in enumerate(batch):
+            data["publishedfileids[%d]" % i] = wsid
+        req = urllib.request.Request(
+            "https://api.steampowered.com/ISteamRemoteStorage/GetPublishedFileDetails/v1/",
+            data=urllib.parse.urlencode(data).encode())
+        try:
+            with urllib.request.urlopen(req, timeout=10) as r:
+                details = json.load(r)["response"]["publishedfiledetails"]
+        except Exception:
+            return titles
+        for d in details:
+            if d.get("title"):
+                titles[str(d["publishedfileid"])] = d["title"]
+    return titles
+
+
+# ---------------------------------------------------------------------------
+# Finding Steam
+# ---------------------------------------------------------------------------
+
+def steam_roots():
+    roots = []
+    if sys.platform == "win32":
+        import winreg
+        keys = [(winreg.HKEY_CURRENT_USER, r"Software\Valve\Steam", "SteamPath"),
+                (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\Valve\Steam", "InstallPath"),
+                (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Valve\Steam", "InstallPath")]
+        for hive, key, value in keys:
+            try:
+                with winreg.OpenKey(hive, key) as k:
+                    roots.append(winreg.QueryValueEx(k, value)[0])
+            except OSError:
+                pass
+        roots += [r"C:\Program Files (x86)\Steam", r"C:\Program Files\Steam"]
+    else:
+        home = os.path.expanduser("~")
+        roots += [os.path.join(home, ".steam", "steam"),
+                  os.path.join(home, ".local", "share", "Steam"),
+                  os.path.join(home, ".var", "app", "com.valvesoftware.Steam", ".local", "share", "Steam"),
+                  os.path.join(home, "Library", "Application Support", "Steam")]
+    return [r for r in roots if os.path.isdir(os.path.join(r, "steamapps"))]
+
+
+def library_folders(steam_root):
+    libs = [steam_root]
+    try:
+        with open(os.path.join(steam_root, "steamapps", "libraryfolders.vdf"), encoding="utf-8", errors="replace") as f:
+            text = f.read()
+    except OSError:
+        return libs
+    # New format: "path" "D:\\SteamLibrary". Old format: "1" "D:\\SteamLibrary".
+    for m in re.finditer(r'"(?:path|\d+)"\s+"((?:[^"\\]|\\.)*)"', text):
+        path = m.group(1).replace("\\\\", "\\")
+        if os.path.isdir(os.path.join(path, "steamapps")):
+            libs.append(path)
+    return libs
+
+
+def find_hl2_addon_folders():
+    found, seen = [], set()
+    for root in steam_roots():
+        for lib in library_folders(root):
+            key = os.path.normcase(os.path.realpath(lib))
+            if key in seen:
+                continue
+            seen.add(key)
+
+            workshop = os.path.join(lib, "steamapps", "workshop", "content", HL2_APPID)
+            if os.path.isdir(workshop):
+                found.append(workshop)
+
+            # hl2/custom, episodic/custom, ep2/custom, lostcoast/custom...
+            game = os.path.join(lib, "steamapps", "common", "Half-Life 2")
+            if os.path.isdir(game):
+                for sub in sorted(os.listdir(game)):
+                    custom = os.path.join(game, sub, "custom")
+                    if os.path.isdir(custom):
+                        found.append(custom)
+    return found
+
+
+# ---------------------------------------------------------------------------
+# Analysis + report
+# ---------------------------------------------------------------------------
+
+def analyze(addons, min_dupe_size):
+    by_path = defaultdict(list)  # path -> [(addon, size, crc)]
+    for addon in addons:
+        for path, (size, crc) in addon.files.items():
+            by_path[path].append((addon, size, crc))
+
+    conflicts, same_path = [], []
+    for path, copies in sorted(by_path.items()):
+        if len(copies) < 2:
+            continue
+        identical = len({(s, c) for _, s, c in copies}) == 1
+        (same_path if identical else conflicts).append((path, copies))
+
+    def severity(path):
+        return 2 if path.startswith(SEVERE_DIRS) else 1 if path.startswith("models/") else 0
+    conflicts.sort(key=lambda item: (-severity(item[0]), item[0]))
+
+    # Identical contents under different paths, in different addons.
+    by_content = defaultdict(list)
+    for path, copies in by_path.items():
+        addon, size, crc = copies[0]  # same-path copies are reported above
+        if size >= max(min_dupe_size, 1):
+            by_content[(size, crc)].append((path, addon))
+    content_dupes = [(size, group) for (size, _), group in by_content.items()
+                     if len(group) > 1 and len({id(a) for _, a in group}) > 1]
+    content_dupes.sort(key=lambda item: (-item[0], item[1][0][0]))
+
+    return conflicts, same_path, content_dupes, severity
+
+
+def nice_size(n):
+    if n >= 1024 * 1024:
+        return "%.1f MB" % (n / 1048576)
+    if n >= 1024:
+        return "%.1f KB" % (n / 1024)
+    return "%d bytes" % n
+
+
+def format_report(addons, containers, analysis, limit):
+    conflicts, same_path, content_dupes, severity = analysis
+    out = []
+    w = out.append
+
+    total_files = sum(len(a.files) for a in addons)
+    w("HL2 Addon Checker: %d addons, %d files" % (len(addons), total_files))
+    w("%d conflicts, %d same-path duplicates, %d content duplicates"
+      % (len(conflicts), len(same_path), len(content_dupes)))
+    w("")
+    w("Scanned:")
+    for c in containers:
+        w("  " + c)
+    w("")
+
+    def more(i, items):
+        if limit and i >= limit:
+            w("  ... and %d more (see the report file)" % (len(items) - i))
+            return True
+        return False
+
+    broken = [a for a in addons if a.errors]
+    if broken:
+        w("== PROBLEMS READING ADDONS (%d) ==" % len(broken))
+        for a in broken:
+            w("  " + a.name)
+            for e in a.errors[:5]:
+                w("      " + e)
+        w("")
+
+    w("== CONFLICTS (%d) ==" % len(conflicts))
+    w("Same file, different contents. The game only uses one copy, so the other")
+    w("addons lose that file. [!] = scripts, UI, cfg or maps: likely to break things.")
+    w("[MODEL] = if a model's .mdl/.vvd/.vtx/.phy parts come from different addons")
+    w("it can turn invisible, distort or crash the game.")
+    w("")
+    for i, (path, copies) in enumerate(conflicts):
+        if more(i, conflicts):
+            break
+        tag = {2: "[!] ", 1: "[MODEL] "}.get(severity(path), "")
+        w("  %s%s" % (tag, path))
+        for addon, size, _ in copies:
+            w("      %s  (%s)" % (addon.name, nice_size(size)))
+    w("")
+
+    w("== SAME-PATH DUPLICATES (%d) ==" % len(same_path))
+    w("Same file, identical contents, in several addons. Harmless.")
+    w("")
+    for i, (path, copies) in enumerate(same_path):
+        if more(i, same_path):
+            break
+        w("  " + path)
+        w("      in: " + ", ".join(a.name for a, _, _ in copies))
+    w("")
+
+    w("== CONTENT DUPLICATES (%d) ==" % len(content_dupes))
+    w("Identical contents under different names in different addons. Harmless,")
+    w("just wasted space. Biggest first.")
+    w("")
+    for i, (size, group) in enumerate(content_dupes):
+        if more(i, content_dupes):
+            break
+        w("  %s each:" % nice_size(size))
+        for path, addon in group:
+            w("      %s  [%s]" % (path, addon.name))
+
+    return "\n".join(out) + "\n"
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Find Half-Life 2 addons that conflict or duplicate each other.")
+    ap.add_argument("folders", nargs="*",
+                    help="folders containing addons (workshop/content/220, hl2/custom...). Default: find automatically")
+    ap.add_argument("--out", default="addon_report.txt", help="report file (default: addon_report.txt)")
+    ap.add_argument("--limit", type=int, default=25, help="entries per section shown on screen, 0 = all (default 25)")
+    ap.add_argument("--min-dupe-size", type=int, default=1024,
+                    help="smallest file in bytes checked for content duplicates (default 1024)")
+    ap.add_argument("--offline", action="store_true", help="don't look up Workshop item titles on Steam")
+    args = ap.parse_args()
+
+    # Keep the window open when double-clicked on Windows.
+    pause = sys.platform == "win32" and not args.folders and sys.stdin and sys.stdin.isatty()
+
+    containers = args.folders or find_hl2_addon_folders()
+    if not containers:
+        print("Couldn't find Half-Life 2's Workshop or custom folders.")
+        print(r'Pass them yourself, e.g.:  python addon_checker.py "D:\SteamLibrary\steamapps\workshop\content\220"')
+        if pause:
+            input("Press Enter to exit...")
+        return 1
+
+    addons = scan(containers)
+
+    ids = {a.workshop_id for a in addons if a.workshop_id}
+    if ids and not args.offline:
+        titles = fetch_workshop_titles(ids)
+        for a in addons:
+            if a.workshop_id in titles:
+                a.name = "%s [workshop %s]" % (titles[a.workshop_id], a.workshop_id)
+
+    analysis = analyze(addons, args.min_dupe_size)
+    with open(args.out, "w", encoding="utf-8") as f:
+        f.write(format_report(addons, containers, analysis, 0))
+
+    print(format_report(addons, containers, analysis, args.limit))
+    print("Full report: " + os.path.abspath(args.out))
+
+    if pause:
+        input("Press Enter to exit...")
+    return 2 if analysis[0] else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

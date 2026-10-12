@@ -1,23 +1,65 @@
-# Addon Checker for Half-Life 2
+# HL2 Addon Checker
 
-A Source SDK 2013 mod feature that scans your `custom/` addons and reports:
+Finds Half-Life 2 addons that break each other. It scans your Steam Workshop
+addons (`steamapps/workshop/content/220`) and your `custom/` folders, and reports:
 
 | Section | Meaning |
 |---|---|
-| **Conflicts** | Two addons ship the same file with **different** contents. The game only uses one, so the other addon is partly broken. When the engine's load order is known, the report marks which copy is `used` and which is `ignored`. |
+| **Conflicts** | Two addons ship the same file with **different** contents. The game only uses one, so the other addon is partly broken. |
 | `[!]` conflicts | The file is in `scripts/`, `resource/`, `cfg/` or `maps/`: weapon scripts, sound scripts, UI and maps. These are the most likely to break gameplay. |
 | `[MODEL]` conflicts | A model whose `.mdl`/`.vvd`/`.vtx`/`.phy` parts may come from different addons. Mixed parts give invisible or distorted models, or crashes. |
-| **Same-path duplicates** | Same file, identical contents, in several addons. Harmless; you can delete the extras. |
+| **Same-path duplicates** | Same file, identical contents, in several addons. Harmless. |
 | **Content duplicates** | Identical file contents under different names in different addons. Harmless, just wasted space. |
 
-It reads both kinds of addon in `custom/`:
+## Running it
 
-- **Folders**, including a `pak01_dir.vpk` inside a folder
-- **VPKs** (v1 and v2): single-file `foo.vpk`, or `foo_dir.vpk` with its `foo_000.vpk`… parts
+You need [Python 3.7+](https://www.python.org/downloads/). No extra packages.
 
-VPK contents aren't extracted. The checker compares the CRC32 values stored in each VPK's directory, so a scan takes seconds even with gigabytes of addons.
+```sh
+python addon_checker.py
+```
 
-## Using it in game
+That finds Steam and every Steam library folder by itself, then scans:
+
+- `steamapps/workshop/content/220/`
+- every `custom/` folder in Half-Life 2 (`hl2/custom`, `episodic/custom`, `ep2/custom`, …)
+
+On Windows you can also double-click `addon_checker.py`; the window stays open until you press Enter.
+
+A summary is printed, and the full report is saved to `addon_report.txt`.
+Workshop items are shown by their title, looked up from Steam's public API.
+Use `--offline` to skip that and show item IDs instead.
+
+| Option | |
+|---|---|
+| `python addon_checker.py FOLDER ...` | Scan these folders instead. Each one should *contain* addons, e.g. `...\workshop\content\220` or `...\hl2\custom`. |
+| `--out FILE` | Report file (default `addon_report.txt`) |
+| `--limit N` | Entries per section on screen, 0 = all (default 25). The file always has everything. |
+| `--min-dupe-size N` | Smallest file in bytes checked for content duplicates (default 1024) |
+| `--offline` | Don't look up Workshop titles |
+
+The exit code is 2 when conflicts were found and 0 when none were.
+
+## What it reads
+
+- **Workshop items:** each item folder is one addon. The VPKs inside are read whether they're plain or compressed. Supported compression: LZMA (standard and Valve's `LZMA` header), xz, gzip, bzip2, zlib, and zip files containing VPKs. Loose files in an item folder are read too.
+- **`custom/` addons:** sub-folders (loose files, plus a `pak01_dir.vpk` inside), single `foo.vpk` files, and multi-part `foo_dir.vpk` + `foo_000.vpk`…
+- VPK contents are never extracted. The tool compares the CRC32 values each VPK stores for its files, so even gigabytes of addons scan quickly.
+- Files at an addon's root (`addoninfo.txt`, preview images…) are ignored, since they aren't game content.
+
+If a Workshop item uses a format the tool doesn't recognize, the report lists it under
+**Problems reading addons**, with the file's first bytes, so support can be added.
+
+**Limitation:** the tool can tell you *that* two addons fight over a file, but not *which one wins*.
+That depends on the game's addon load order.
+
+## Source SDK version (optional)
+
+`src/addonchecker/` has the same checker as C++ for a Source SDK 2013 **mod** (a `client.dll`).
+It runs inside that mod with an `addon_check` console command. It only scans `custom/` folders,
+not the Workshop. Most people want the Python tool above.
+
+### Console commands
 
 | Command | What it does |
 |---|---|
@@ -29,7 +71,7 @@ VPK contents aren't extracted. The checker compares the CRC32 values stored in e
 
 The console shows a summary. The full report is written to `<your mod>/addon_report.txt`.
 
-## Adding it to your mod
+### Adding it to your mod
 
 You need a Source SDK 2013 mod. You can build one from [ValveSoftware/source-sdk-2013](https://github.com/ValveSoftware/source-sdk-2013), following its README.
 
@@ -64,7 +106,7 @@ You need a Source SDK 2013 mod. You can build one from [ValveSoftware/source-sdk
 
 4. Copy the built `client.dll` into your mod's `bin/`, start the mod, and run `addon_check` in the console.
 
-## Testing without the game
+### Testing without the game
 
 The scanner also builds as a command-line tool, which is useful for checking a real `custom/` folder quickly:
 
@@ -77,7 +119,7 @@ On Windows, MSVC works too: `cl /EHsc /O2 /I src\addonchecker tools\addon_checke
 
 The tool doesn't know the engine's load order, so it lists conflicts without `used`/`ignored`. It exits with code 2 when conflicts are found.
 
-## Files
+### Files
 
 ```
 src/addonchecker/
