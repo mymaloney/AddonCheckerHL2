@@ -23,6 +23,8 @@ import os
 import re
 import struct
 import sys
+import threading
+import time
 import urllib.parse
 import urllib.request
 import zipfile
@@ -36,6 +38,9 @@ VPK_ARCHIVE_PART = re.compile(r"_\d{3}\.vpk$", re.IGNORECASE)  # foo_000.vpk hol
 
 # Conflicts here replace weapon/sound scripts, UI or maps: most likely to break the game.
 SEVERE_DIRS = ("scripts/", "resource/", "cfg/", "maps/")
+
+
+MAX_VPK_TREE = 512 * 1024 * 1024  # real directories are a few MB
 
 
 class BadAddon(Exception):
@@ -95,12 +100,16 @@ class ZlibReader:
 def _valve_lzma(path):
     # Valve's own header: "LZMA", uncompressed size, compressed size, 5 LZMA property bytes
     f = open(path, "rb")
-    head = f.read(17)
-    props, dict_size = head[12], struct.unpack_from("<I", head, 13)[0]
-    lc, props = props % 9, props // 9
-    lp, pb = props % 5, props // 5
-    filt = {"id": lzma.FILTER_LZMA1, "dict_size": dict_size, "lc": lc, "lp": lp, "pb": pb}
-    return lzma.open(f, format=lzma.FORMAT_RAW, filters=[filt])
+    try:
+        head = f.read(17)
+        props, dict_size = head[12], struct.unpack_from("<I", head, 13)[0]
+        lc, props = props % 9, props // 9
+        lp, pb = props % 5, props // 5
+        filt = {"id": lzma.FILTER_LZMA1, "dict_size": dict_size, "lc": lc, "lp": lp, "pb": pb}
+        return lzma.open(f, format=lzma.FORMAT_RAW, filters=[filt])
+    except Exception:
+        f.close()
+        raise
 
 
 # (name, test on the first bytes, opener). Every candidate must also decompress to a VPK header.
@@ -147,6 +156,8 @@ def parse_vpk(stream, files, magic_read=False):
     if not magic_read and read_exact(stream, 4) != VPK_MAGIC:
         raise BadAddon("not a VPK file")
     version, tree_size = struct.unpack("<II", read_exact(stream, 8))
+    if tree_size > MAX_VPK_TREE:
+        raise BadAddon("VPK directory claims to be %d MB, which can't be right" % (tree_size >> 20))
     if version == 2:
         read_exact(stream, 16)  # section sizes we don't need
     elif version != 1:
@@ -189,6 +200,18 @@ def parse_vpk(stream, files, magic_read=False):
 
 def read_packed_file(addon, path):
     """Adds a (compressed) VPK or a zip of VPKs to the addon. Returns False if it's neither."""
+    now_reading(path)
+    # Check for a VPK first: a VPK whose last file is a map ends with the map's packed-files
+    # zip, so it can also look like a zip file.
+    opener = detect_vpk(path)
+    if opener:
+        s = opener(path)
+        try:
+            parse_vpk(s, addon.files)
+        finally:
+            s.close()
+        return True
+
     if zipfile.is_zipfile(path):
         found = False
         with zipfile.ZipFile(path) as z:
@@ -200,16 +223,7 @@ def read_packed_file(addon, path):
                         parse_vpk(s, addon.files, magic_read=True)
                         found = True
         return found
-
-    opener = detect_vpk(path)
-    if not opener:
-        return False
-    s = opener(path)
-    try:
-        parse_vpk(s, addon.files)
-    finally:
-        s.close()
-    return True
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -217,6 +231,7 @@ def read_packed_file(addon, path):
 # ---------------------------------------------------------------------------
 
 def crc_file(path):
+    now_reading(path)
     crc, size = 0, 0
     with open(path, "rb") as f:
         while True:
@@ -233,7 +248,14 @@ def scan_folder_addon(addon, root):
     for entry in sorted(os.scandir(root), key=lambda e: e.name.lower()):
         if entry.is_dir():
             # Loose content: materials/, models/, sound/...
-            for dirpath, _, names in os.walk(entry.path):
+            seen_dirs = set()
+            for dirpath, dirs, names in os.walk(entry.path):
+                # Don't loop through junctions / links that point back up the tree.
+                real = os.path.normcase(os.path.realpath(dirpath))
+                if real in seen_dirs:
+                    dirs[:] = []
+                    continue
+                seen_dirs.add(real)
                 for name in names:
                     if is_cache(name):
                         continue
@@ -308,25 +330,68 @@ def parent_name(path):
     return os.path.basename(os.path.dirname(path))
 
 
-def print_progress(i, total):
-    print("\rReading addon %d/%d..." % (i, total), end="" if i < total else "\n", file=sys.stderr, flush=True)
+# The file being read right now, so a slow or stuck read can be reported.
+_reading = {"path": None, "since": 0.0}
 
 
-def scan(containers, progress=print_progress, workshop_dirs=()):
+def now_reading(path):
+    _reading["path"], _reading["since"] = path, time.time()
+
+
+class SlowReadWatch:
+    """While active, calls slow(path, seconds) every 10 seconds that one file is still being read."""
+
+    def __init__(self, slow):
+        self.slow = slow
+        self.stop = threading.Event()
+
+    def __enter__(self):
+        def watch():
+            reported = None
+            while not self.stop.wait(1):
+                path, since = _reading["path"], _reading["since"]
+                waited = int(time.time() - since)
+                if path and waited >= 10 and (path, waited // 10) != reported:
+                    reported = (path, waited // 10)
+                    self.slow(path, waited)
+        if self.slow:
+            threading.Thread(target=watch, daemon=True).start()
+        return self
+
+    def __exit__(self, *exc):
+        self.stop.set()
+        now_reading(None)
+
+
+def print_progress(i, total, name=""):
+    line = "Reading addon %d/%d: %s" % (i, total, name)
+    print("\r" + line[:110].ljust(110), end="" if i < total else "\n", file=sys.stderr, flush=True)
+
+
+def print_slow(path, seconds):
+    print("\n  still reading %s (%ds)..." % (path, seconds), file=sys.stderr, flush=True)
+
+
+def read_addon(addon, kind):
+    now_reading(addon.location)
+    if kind == "folder":
+        scan_folder_addon(addon, addon.location)
+    else:
+        try:
+            if not read_packed_file(addon, addon.location):
+                addon.errors.append("not a VPK file")
+        except READ_ERRORS as e:
+            addon.errors.append(str(e))
+    # Files at the addon root (addoninfo.txt...) and caches aren't game content.
+    addon.files = {p: v for p, v in addon.files.items() if "/" in p and not is_cache(p)}
+
+
+def scan(containers, progress=print_progress, workshop_dirs=(), slow=print_slow):
     addons = collect_addons(containers, workshop_dirs)
-    total = len(addons)
-    for i, (addon, kind) in enumerate(addons, 1):
-        progress(i, total)
-        if kind == "folder":
-            scan_folder_addon(addon, addon.location)
-        else:
-            try:
-                if not read_packed_file(addon, addon.location):
-                    addon.errors.append("not a VPK file")
-            except READ_ERRORS as e:
-                addon.errors.append(str(e))
-        # Files at the addon root (addoninfo.txt...) and caches aren't game content.
-        addon.files = {p: v for p, v in addon.files.items() if "/" in p and not is_cache(p)}
+    with SlowReadWatch(slow):
+        for i, (addon, kind) in enumerate(addons, 1):
+            progress(i, len(addons), addon.name)
+            read_addon(addon, kind)
     return [a for a, _ in addons]
 
 
@@ -334,10 +399,17 @@ def scan(containers, progress=print_progress, workshop_dirs=()):
 # Workshop titles
 # ---------------------------------------------------------------------------
 
-def fetch_workshop_titles(ids):
-    """Looks up item titles with Steam's public API. Returns {} if offline."""
+def fetch_workshop_titles(ids, deadline=20):
+    """Looks up item titles with Steam's public API. Gives up after `deadline` seconds,
+    returning whatever it has (nothing if offline)."""
     titles = {}
-    ids = sorted(ids)
+    worker = threading.Thread(target=_fetch_titles, args=(sorted(ids), titles), daemon=True)
+    worker.start()
+    worker.join(deadline)
+    return dict(titles)
+
+
+def _fetch_titles(ids, titles):
     for start in range(0, len(ids), 100):
         batch = ids[start:start + 100]
         data = {"itemcount": len(batch)}
@@ -350,11 +422,10 @@ def fetch_workshop_titles(ids):
             with urllib.request.urlopen(req, timeout=10) as r:
                 details = json.load(r)["response"]["publishedfiledetails"]
         except Exception:
-            return titles
+            return
         for d in details:
             if d.get("title"):
                 titles[str(d["publishedfileid"])] = d["title"]
-    return titles
 
 
 # ---------------------------------------------------------------------------
@@ -412,7 +483,7 @@ def fallback_vpks(game_dir):
     return vpks
 
 
-def read_base_game(game_dir):
+def read_base_game(game_dir, slow=print_slow):
     """The original game's files as the game sees them: path -> (size, crc32).
     Returns (files, number of VPKs read, where the list of VPKs came from, errors)."""
     vpks, source = gameinfo_vpks(game_dir)
@@ -420,14 +491,15 @@ def read_base_game(game_dir):
         vpks, source = fallback_vpks(game_dir), "the game folders (gameinfo.txt not readable)"
     base = Addon(name="Half-Life 2 (base game)", location=game_dir)
     errors = []
-    for vpk in vpks:
-        part = Addon(name=vpk, location=vpk)
-        try:
-            read_packed_file(part, vpk)
-        except READ_ERRORS as e:
-            errors.append("%s: %s" % (vpk, e))
-        for path, content in part.files.items():
-            base.files.setdefault(path, content)  # first in the search path wins
+    with SlowReadWatch(slow):
+        for vpk in vpks:
+            part = Addon(name=vpk, location=vpk)
+            try:
+                read_packed_file(part, vpk)
+            except READ_ERRORS as e:
+                errors.append("%s: %s" % (vpk, e))
+            for path, content in part.files.items():
+                base.files.setdefault(path, content)  # first in the search path wins
     return base.files, len(vpks), source, errors
 
 
@@ -1077,7 +1149,10 @@ def main():
 
     ids = {a.workshop_id for a in addons if a.workshop_id}
     if ids and not args.offline:
+        print("Looking up Workshop titles on Steam...", file=sys.stderr, flush=True)
         titles = fetch_workshop_titles(ids)
+        if not titles:
+            print("  no answer from Steam, showing Workshop ids instead", file=sys.stderr)
         for a in addons:
             if a.workshop_id in titles:
                 a.name = "%s [workshop %s]" % (titles[a.workshop_id], a.workshop_id)

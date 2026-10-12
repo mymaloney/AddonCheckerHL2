@@ -14,6 +14,7 @@ with the python.org installer on Windows).
 
 import json
 import os
+import queue
 import shutil
 import sys
 import threading
@@ -95,8 +96,12 @@ class Organizer:
         self.by_path = {}
         self.stats = {}
 
+        # The scan runs in a background thread; it hands window updates to the main thread
+        # through this queue instead of touching tkinter itself.
+        self.ui_queue = queue.Queue()
         self.load_settings()
         self.build_ui()
+        self.poll_ui()
         self.filter_text.trace_add("write", lambda *_: self.refresh_list())
         self.last_wins.trace_add("write", lambda *_: self.on_direction_changed())
         root.protocol("WM_DELETE_WINDOW", self.on_close)
@@ -291,9 +296,28 @@ class Organizer:
         self.tree.delete(*self.tree.get_children())
         threading.Thread(target=self.scan_thread, daemon=True).start()
 
+    def poll_ui(self):
+        try:
+            while True:
+                self.ui_queue.get_nowait()()
+        except queue.Empty:
+            pass
+        self.root.after(100, self.poll_ui)
+
+    def ui(self, fn):
+        """Run fn on the main thread (for use from the scan thread)."""
+        self.ui_queue.put(fn)
+
+    def set_status(self, text):
+        self.ui(lambda: self.status.config(text=text))
+
     def scan_thread(self):
-        def progress(i, total):
-            self.root.after(0, lambda: self.status.config(text="Reading addon %d of %d..." % (i, total)))
+        def progress(i, total, name=""):
+            self.set_status("Reading addon %d of %d: %s" % (i, total, name))
+
+        def slow(path, seconds):
+            self.set_status("Still reading %s (%d s). If this never finishes, that file is the problem."
+                            % (path, seconds))
         try:
             game = ac.resolve_game_dir(self.game_dir)
             workshop = ac.resolve_workshop_dir(self.workshop_dir)
@@ -303,10 +327,11 @@ class Organizer:
             workshop = workshop or (game and ac.workshop_dir_for_game(game))
             game = game or (workshop and ac.game_dir_for_workshop(workshop))
             containers, path = ac.game_folders(game, workshop)
-            addons = ac.scan(containers, progress, workshop_dirs=[workshop] if workshop else []) if containers else []
+            addons = (ac.scan(containers, progress, workshop_dirs=[workshop] if workshop else [], slow=slow)
+                      if containers else [])
             ids = {a.workshop_id for a in addons if a.workshop_id}
             if ids:
-                self.root.after(0, lambda: self.status.config(text="Looking up Workshop titles..."))
+                self.set_status("Looking up Workshop titles on Steam...")
                 titles = ac.fetch_workshop_titles(ids)
                 for a in addons:
                     if a.workshop_id in titles:
@@ -316,15 +341,16 @@ class Organizer:
             entries = ac.read_load_order(path) if path else []
             base, base_info = {}, "original game files not checked (Half-Life 2 folder not found)"
             if game:
-                self.root.after(0, lambda: self.status.config(text="Reading the original game files..."))
-                base, vpk_count, _, _ = ac.read_base_game(game)
+                self.set_status("Reading the original game files...")
+                base, vpk_count, _, _ = ac.read_base_game(game, slow)
                 base_info = ("compared with %d original game files" % len(base) if vpk_count
                              else "no original game VPKs found, so files weren't compared with them")
         except Exception as e:  # report anything unexpected instead of dying silently
             message = str(e)
-            self.root.after(0, lambda: messagebox.showerror("Scan failed", message))
+            self.set_status("Scan failed: " + message)
+            self.ui(lambda: messagebox.showerror("Scan failed", message))
             return
-        self.root.after(0, lambda: self.scan_done(game, workshop, addons, path, entries, base, base_info))
+        self.ui(lambda: self.scan_done(game, workshop, addons, path, entries, base, base_info))
 
     def scan_done(self, game, workshop, addons, path, entries, base=None, base_info=""):
         self.base, self.base_info = base or {}, base_info
