@@ -1,0 +1,55 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        cxx: [g++, clang++]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build (C++98, warnings as errors)
+        run: ${{ matrix.cxx }} -std=c++98 -Wall -Wextra -Werror -O2 -I src/addonchecker tools/addon_checker_cli.cpp src/addonchecker/addon_scanner.cpp -o addon_checker
+      - name: Test
+        run: python3 tests/run_tests.py ./addon_checker -v
+
+  windows:
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x86, x64] # the game's client.dll is 32-bit on older SDK builds
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: ${{ matrix.arch }}
+      - name: Build
+        shell: cmd
+        run: cl /nologo /W3 /EHsc /O2 /D_CRT_SECURE_NO_WARNINGS /I src\addonchecker tools\addon_checker_cli.cpp src\addonchecker\addon_scanner.cpp /Fe:addon_checker.exe
+      - name: Test
+        run: python tests/run_tests.py addon_checker.exe -v
+
+  # The game-side file needs the SDK, so compile it (syntax only) against the
+  # real headers. Pinned so an SDK update can't turn this red on its own.
+  sdk-headers:
+    runs-on: ubuntu-latest
+    env:
+      SDK_COMMIT: be57e3d01ac7d7aa6a2cacbfef187c0b46616db0
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fetch Source SDK 2013 headers
+        run: |
+          git init -q sdk
+          cd sdk
+          git remote add origin https://github.com/ValveSoftware/source-sdk-2013.git
+          git sparse-checkout set src/common src/public src/game/client src/game/shared
+          git fetch -q --depth 1 --filter=blob:none origin "$SDK_COMMIT"
+          git checkout -q FETCH_HEAD
+      - name: Check
+        run: sh tests/check_sdk_build.sh sdk

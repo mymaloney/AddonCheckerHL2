@@ -51,10 +51,25 @@ struct ContentGroup
 	std::vector<Copy> copies;
 };
 
+struct ModelPart
+{
+	std::string       ext;    // ".mdl", ".vvd", ".dx90.vtx", ".phy" or ".ani"
+	std::vector<Copy> copies; // sorted by load order when it's known
+};
+
+// A model whose parts the game takes from more than one addon.
+struct ModelGroup
+{
+	std::string            path;       // without extension, e.g. "models/props_c17/chair01"
+	bool                   orderKnown; // false: the parts mix in some load orders, not necessarily this one
+	std::vector<ModelPart> parts;
+};
+
 struct Report
 {
 	std::vector<Addon>        addons;
 	std::vector<PathGroup>    conflicts;     // same path, different contents
+	std::vector<ModelGroup>   mixedModels;   // model parts coming from different addons
 	std::vector<PathGroup>    samePathDupes; // same path, identical contents
 	std::vector<ContentGroup> contentDupes;  // identical contents, different paths
 	size_t                    totalFiles;

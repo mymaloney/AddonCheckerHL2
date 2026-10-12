@@ -1,6 +1,11 @@
 //========================================================================
 // Addon Checker - scanner. See addon_scanner.h.
 //========================================================================
+// The client project defines _snprintf as use_Q_snprintf_instead to steer SDK
+// code to Q_snprintf. This file doesn't use the SDK and needs the real one on
+// VS2013 and older, so undo that before any CRT header declares it.
+#undef _snprintf
+
 #include "addon_scanner.h"
 
 #include <ctype.h>
@@ -71,6 +76,16 @@ struct DirEntry
 	bool        isDir;
 };
 
+struct ByName
+{
+	bool operator()( const DirEntry &a, const DirEntry &b ) const
+	{
+		std::string la = NormalizePath( a.name ), lb = NormalizePath( b.name );
+		if ( la != lb ) return la < lb;
+		return a.name < b.name;
+	}
+};
+
 static bool ListDir( const std::string &dir, std::vector<DirEntry> &out )
 {
 #ifdef _WIN32
@@ -105,6 +120,36 @@ static bool ListDir( const std::string &dir, std::vector<DirEntry> &out )
 		out.push_back( e );
 	}
 	closedir( d );
+#endif
+	// The OS lists in no particular order; sort so every scan gives the same report.
+	std::sort( out.begin(), out.end(), ByName() );
+	return true;
+}
+
+// Identifies a folder on disk (following symlinks/junctions), so a link back
+// to a parent folder can't make the walk recurse forever.
+typedef std::pair<uint64_t, uint64_t> DirId;
+
+static bool GetDirId( const std::string &dir, DirId &id )
+{
+#ifdef _WIN32
+	HANDLE h = CreateFileA( dir.c_str(), 0, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+		NULL, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, NULL );
+	if ( h == INVALID_HANDLE_VALUE )
+		return false;
+	BY_HANDLE_FILE_INFORMATION info;
+	BOOL ok = GetFileInformationByHandle( h, &info );
+	CloseHandle( h );
+	if ( !ok )
+		return false;
+	id.first = info.dwVolumeSerialNumber;
+	id.second = ( (uint64_t)info.nFileIndexHigh << 32 ) | info.nFileIndexLow;
+#else
+	struct stat st;
+	if ( stat( dir.c_str(), &st ) != 0 )
+		return false;
+	id.first = (uint64_t)st.st_dev;
+	id.second = (uint64_t)st.st_ino;
 #endif
 	return true;
 }
@@ -229,8 +274,21 @@ static bool ReadVpk( const std::string &vpkPath, Addon &addon )
 		return false;
 	}
 
-	std::vector<unsigned char> tree( treeSize );
-	bool readOk = treeSize == 0 || fread( &tree[0], 1, treeSize, f ) == treeSize;
+	// Read in chunks rather than allocating treeSize up front: a corrupt header
+	// could otherwise ask for gigabytes before we find out the file is short.
+	std::vector<unsigned char> tree;
+	bool readOk = true;
+	while ( tree.size() < treeSize )
+	{
+		size_t have = tree.size();
+		size_t chunk = std::min<size_t>( treeSize - have, 1024 * 1024 );
+		tree.resize( have + chunk );
+		if ( fread( &tree[have], 1, chunk, f ) != chunk )
+		{
+			readOk = false;
+			break;
+		}
+	}
 	fclose( f );
 	if ( !readOk )
 	{
@@ -290,10 +348,17 @@ static bool ReadVpk( const std::string &vpkPath, Addon &addon )
 // Loose folder addons
 //------------------------------------------------------------------------
 
-static void WalkFolder( const std::string &root, const std::string &rel, Addon &addon )
+// open = the folders we're currently inside, to stop at symlink loops.
+static void WalkFolder( const std::string &root, const std::string &rel, Addon &addon, std::set<DirId> &open )
 {
+	std::string dir = rel.empty() ? root : root + "/" + rel;
+	DirId id;
+	bool haveId = GetDirId( dir, id );
+	if ( haveId && !open.insert( id ).second )
+		return; // links back to a folder we're already walking
+
 	std::vector<DirEntry> entries;
-	ListDir( rel.empty() ? root : root + "/" + rel, entries );
+	ListDir( dir, entries );
 
 	for ( size_t i = 0; i < entries.size(); i++ )
 	{
@@ -302,7 +367,7 @@ static void WalkFolder( const std::string &root, const std::string &rel, Addon &
 
 		if ( e.isDir )
 		{
-			WalkFolder( root, relPath, addon );
+			WalkFolder( root, relPath, addon, open );
 			continue;
 		}
 
@@ -328,6 +393,9 @@ static void WalkFolder( const std::string &root, const std::string &rel, Addon &
 		fe.readable = CrcFile( root + "/" + relPath, fe.crc, fe.size );
 		addon.files.push_back( fe );
 	}
+
+	if ( haveId )
+		open.erase( id );
 }
 
 // foo_000.vpk, foo_001.vpk... hold the data for foo_dir.vpk, not separate addons.
@@ -389,6 +457,16 @@ static int Severity( const std::string &path )
 	return 0;
 }
 
+struct ByAddonLoadOrder
+{
+	explicit ByAddonLoadOrder( const Report &r ) : m_Report( &r ) {}
+	bool operator()( size_t a, size_t b ) const
+	{
+		return m_Report->addons[a].loadOrder < m_Report->addons[b].loadOrder;
+	}
+	const Report *m_Report;
+};
+
 struct ByLoadOrder
 {
 	explicit ByLoadOrder( const Report &r ) : m_Report( &r ) {}
@@ -413,6 +491,153 @@ struct BySize
 {
 	bool operator()( const ContentGroup &a, const ContentGroup &b ) const { return a.size > b.size; }
 };
+
+struct ByPath
+{
+	explicit ByPath( const Report &r ) : m_Report( &r ) {}
+	bool operator()( const Copy &a, const Copy &b ) const
+	{
+		const std::string &pa = FileOf( *m_Report, a ).path, &pb = FileOf( *m_Report, b ).path;
+		if ( pa != pb ) return pa < pb;
+		return a.addon < b.addon;
+	}
+	const Report *m_Report;
+};
+
+static size_t DistinctPaths( const Report &r, const std::vector<Copy> &copies )
+{
+	std::set<std::string> s;
+	for ( size_t i = 0; i < copies.size(); i++ )
+		s.insert( FileOf( r, copies[i] ).path );
+	return s.size();
+}
+
+//------------------------------------------------------------------------
+// Mixed models
+//------------------------------------------------------------------------
+
+// The parts the engine loads for a model. The .dx80.vtx/.sw.vtx files are
+// only used below DirectX 9, so a mismatch there doesn't show in game.
+static const char *const s_ModelParts[] = { ".mdl", ".vvd", ".dx90.vtx", ".phy", ".ani" };
+static const size_t NUM_MODEL_PARTS = sizeof( s_ModelParts ) / sizeof( s_ModelParts[0] );
+
+// Index into s_ModelParts, or -1 if the path isn't part of a model.
+static int ModelPartIndex( const std::string &path )
+{
+	if ( !StartsWith( path, "models/" ) )
+		return -1;
+	for ( size_t i = 0; i < NUM_MODEL_PARTS; i++ )
+		if ( EndsWith( path, s_ModelParts[i] ) )
+			return (int)i;
+	return -1;
+}
+
+// The copy of a part that the addon ships, or NULL.
+static const Copy *CopyFrom( const std::vector<Copy> &copies, size_t addon )
+{
+	for ( size_t i = 0; i < copies.size(); i++ )
+		if ( copies[i].addon == addon )
+			return &copies[i];
+	return NULL;
+}
+
+// order = addons, highest priority first. The game takes each part from the
+// first addon that has it. That's only safe if a single addon ships every one
+// of those parts with the same contents, i.e. the model is all that addon's.
+static bool IsMixed( const Report &r, const std::vector<std::vector<Copy> > &parts, const std::vector<size_t> &order )
+{
+	std::vector<const Copy *> used( parts.size(), (const Copy *)NULL );
+	for ( size_t p = 0; p < parts.size(); p++ )
+		for ( size_t o = 0; o < order.size() && !used[p]; o++ )
+			used[p] = CopyFrom( parts[p], order[o] );
+
+	for ( size_t o = 0; o < order.size(); o++ )
+	{
+		bool whole = true;
+		for ( size_t p = 0; p < parts.size() && whole; p++ )
+		{
+			if ( !used[p] )
+				continue;
+			const Copy *own = CopyFrom( parts[p], order[o] );
+			whole = own && ( own == used[p] || SameContents( FileOf( r, *own ), FileOf( r, *used[p] ) ) );
+		}
+		if ( whole )
+			return false;
+	}
+	return true;
+}
+
+static void FindMixedModels( const std::map<std::string, std::vector<Copy> > &byPath, Report &r )
+{
+	// model path without extension -> copies of each part, indexed like s_ModelParts
+	std::map<std::string, std::vector<std::vector<Copy> > > byModel;
+	for ( std::map<std::string, std::vector<Copy> >::const_iterator it = byPath.begin(); it != byPath.end(); ++it )
+	{
+		int part = ModelPartIndex( it->first );
+		if ( part < 0 )
+			continue;
+		std::vector<std::vector<Copy> > &parts = byModel[it->first.substr( 0, it->first.size() - strlen( s_ModelParts[part] ) )];
+		parts.resize( NUM_MODEL_PARTS );
+		parts[part] = it->second;
+	}
+
+	for ( std::map<std::string, std::vector<std::vector<Copy> > >::iterator it = byModel.begin(); it != byModel.end(); ++it )
+	{
+		const std::vector<std::vector<Copy> > &parts = it->second;
+
+		std::vector<size_t> addons; // every addon with a part of this model
+		for ( size_t p = 0; p < parts.size(); p++ )
+			for ( size_t c = 0; c < parts[p].size(); c++ )
+				addons.push_back( parts[p][c].addon );
+		std::sort( addons.begin(), addons.end() );
+		addons.erase( std::unique( addons.begin(), addons.end() ), addons.end() );
+		if ( addons.size() < 2 )
+			continue;
+
+		bool orderKnown = true;
+		for ( size_t a = 0; a < addons.size(); a++ )
+			if ( r.addons[addons[a]].loadOrder < 0 )
+				orderKnown = false;
+
+		bool mixed;
+		if ( orderKnown )
+		{
+			std::sort( addons.begin(), addons.end(), ByAddonLoadOrder( r ) );
+			mixed = IsMixed( r, parts, addons );
+		}
+		else if ( addons.size() <= 6 )
+		{
+			// Order unknown: report it if any load order mixes the parts.
+			// addons is sorted, which next_permutation needs to try them all.
+			do
+				mixed = IsMixed( r, parts, addons );
+			while ( !mixed && std::next_permutation( addons.begin(), addons.end() ) );
+		}
+		else
+		{
+			mixed = true; // too many addons to try every order; flag it to be safe
+		}
+
+		if ( !mixed )
+			continue;
+
+		ModelGroup g;
+		g.path = it->first;
+		g.orderKnown = orderKnown;
+		for ( size_t p = 0; p < parts.size(); p++ )
+		{
+			if ( parts[p].empty() )
+				continue;
+			ModelPart mp;
+			mp.ext = s_ModelParts[p];
+			mp.copies = parts[p];
+			if ( orderKnown )
+				std::stable_sort( mp.copies.begin(), mp.copies.end(), ByLoadOrder( r ) );
+			g.parts.push_back( mp );
+		}
+		r.mixedModels.push_back( g );
+	}
+}
 
 Report Scan( const std::vector<std::string> &customDirs,
              const std::vector<std::string> &loadOrder,
@@ -446,7 +671,10 @@ Report Scan( const std::vector<std::string> &customDirs,
 			addon.loadOrder = -1;
 
 			if ( e.isDir )
-				WalkFolder( addon.location, "", addon );
+			{
+				std::set<DirId> open;
+				WalkFolder( addon.location, "", addon, open );
+			}
 			else if ( EndsWith( lower, ".vpk" ) && !IsVpkArchivePart( lower ) )
 				ReadVpk( addon.location, addon );
 			else
@@ -505,26 +733,35 @@ Report Scan( const std::vector<std::string> &customDirs,
 	// Most dangerous conflicts first, alphabetical within a severity.
 	std::stable_sort( r.conflicts.begin(), r.conflicts.end(), BySeverity() );
 
-	// Identical contents under different paths. One copy per path is enough;
-	// same-path copies are already reported above.
+	FindMixedModels( byPath, r );
+
+	// Identical contents under different paths in different addons. A group
+	// qualifies when it spans two paths and two addons: then some two of its
+	// copies differ in both. Same-path copies in it are listed too.
 	if ( minDupeSize < 1 )
 		minDupeSize = 1;
 	std::map<std::pair<uint64_t, uint32_t>, std::vector<Copy> > byContent;
-	for ( std::map<std::string, std::vector<Copy> >::iterator it = byPath.begin(); it != byPath.end(); ++it )
+	for ( size_t a = 0; a < r.addons.size(); a++ )
 	{
-		const Copy &c = it->second[0];
-		const FileEntry &fe = FileOf( r, c );
-		if ( fe.readable && fe.size >= minDupeSize )
-			byContent[std::make_pair( fe.size, fe.crc )].push_back( c );
+		for ( size_t f = 0; f < r.addons[a].files.size(); f++ )
+		{
+			const FileEntry &fe = r.addons[a].files[f];
+			if ( fe.readable && fe.size >= minDupeSize )
+			{
+				Copy c = { a, f };
+				byContent[std::make_pair( fe.size, fe.crc )].push_back( c );
+			}
+		}
 	}
 
 	for ( std::map<std::pair<uint64_t, uint32_t>, std::vector<Copy> >::iterator it = byContent.begin(); it != byContent.end(); ++it )
 	{
-		if ( it->second.size() < 2 || DistinctAddons( it->second ) < 2 )
+		if ( DistinctAddons( it->second ) < 2 || DistinctPaths( r, it->second ) < 2 )
 			continue;
 		ContentGroup g;
 		g.size = it->first.first;
 		g.copies = it->second;
+		std::sort( g.copies.begin(), g.copies.end(), ByPath( r ) );
 		r.contentDupes.push_back( g );
 	}
 
@@ -570,7 +807,7 @@ static bool MoreLeft( std::string &out, size_t index, size_t total, size_t maxPe
 {
 	if ( maxPerSection && index >= maxPerSection )
 	{
-		out += "  ... and " + Num( total - index ) + " more (see addon_report.txt)\n";
+		out += "  ... and " + Num( total - index ) + " more (see the full report)\n";
 		return false;
 	}
 	return true;
@@ -580,7 +817,8 @@ std::string FormatReport( const Report &r, size_t maxPerSection )
 {
 	std::string out;
 	out += "Addon Checker: " + Num( r.addons.size() ) + " addons, " + Num( r.totalFiles ) + " files\n";
-	out += Num( r.conflicts.size() ) + " conflicts, " + Num( r.samePathDupes.size() ) + " same-path duplicates, " +
+	out += Num( r.conflicts.size() ) + " conflicts, " + Num( r.mixedModels.size() ) + " mixed models, " +
+	       Num( r.samePathDupes.size() ) + " same-path duplicates, " +
 	       Num( r.contentDupes.size() ) + " content duplicates\n\n";
 
 	bool anyErrors = false;
@@ -599,8 +837,8 @@ std::string FormatReport( const Report &r, size_t maxPerSection )
 	SectionHeader( out, "CONFLICTS", r.conflicts.size(),
 		"Same file, different contents. The game only uses one copy, so the other\n"
 		"addon loses that file. [!] = scripts/resource/cfg/maps, likely to break\n"
-		"things. [MODEL] = a model's .mdl/.vvd/.vtx/.phy parts coming from different\n"
-		"addons can make it invisible, distorted or crash the game." );
+		"things. [MODEL] = part of a model; MIXED MODELS below lists the models\n"
+		"that end up built from different addons' parts." );
 	for ( size_t i = 0; i < r.conflicts.size(); i++ )
 	{
 		if ( !MoreLeft( out, i, r.conflicts.size(), maxPerSection ) )
@@ -619,6 +857,45 @@ std::string FormatReport( const Report &r, size_t maxPerSection )
 			if ( orderKnown )
 				out += c == 0 ? "  <- used" : "  <- ignored";
 			out += "\n";
+		}
+	}
+	out += "\n";
+
+	SectionHeader( out, "MIXED MODELS", r.mixedModels.size(),
+		"The game takes each part of a model (.mdl .vvd .dx90.vtx .phy .ani) from\n"
+		"the first addon that has it, so these models are built from different\n"
+		"addons' parts. Mismatched parts make a model invisible or distorted, or\n"
+		"crash the game. Keep one addon's full set of parts and remove the rest." );
+	for ( size_t i = 0; i < r.mixedModels.size(); i++ )
+	{
+		if ( !MoreLeft( out, i, r.mixedModels.size(), maxPerSection ) )
+			break;
+		const ModelGroup &g = r.mixedModels[i];
+		out += "  [MODEL] " + g.path;
+		if ( !g.orderKnown )
+			out += "  (in some load orders)";
+		out += "\n";
+
+		for ( size_t p = 0; p < g.parts.size(); p++ )
+		{
+			const ModelPart &mp = g.parts[p];
+			std::string line = "      " + mp.ext;
+			line.resize( 18, ' ' );
+			if ( g.orderKnown )
+			{
+				// Winner first, the rest are ignored.
+				line += r.addons[mp.copies[0].addon].name;
+				for ( size_t c = 1; c < mp.copies.size(); c++ )
+					line += ( c == 1 ? "  (ignored: " : ", " ) + r.addons[mp.copies[c].addon].name;
+				if ( mp.copies.size() > 1 )
+					line += ")";
+			}
+			else
+			{
+				for ( size_t c = 0; c < mp.copies.size(); c++ )
+					line += ( c ? ", " : "" ) + r.addons[mp.copies[c].addon].name;
+			}
+			out += line + "\n";
 		}
 	}
 	out += "\n";
