@@ -842,6 +842,7 @@ class OrganizerTest(unittest.TestCase):
         self.assertEqual(self.dialogs, [])
 
     def test_unsafe_and_unknown_files_arent_installed(self):
+        self.patch(ao, "find_7zip", lambda: None)  # some systems (GitHub's Ubuntu) have 7-Zip
         self.open()
         evil = self.zip_file("evil.zip", {"../../outside.txt": b"x", "materials/a.vtf": b"a"})
         rar = os.path.join(self.tmp, "download", "pack.rar")

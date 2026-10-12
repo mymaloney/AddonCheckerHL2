@@ -279,8 +279,9 @@ def unpack_7zip(source, target):
     except (OSError, subprocess.SubprocessError) as e:
         raise InstallError("can't unpack %s: %s" % (name, e))
     if done.returncode:
-        output = done.stdout.decode("utf-8", "replace").strip().splitlines()
-        raise InstallError("can't unpack %s: %s" % (name, output[-1] if output else "7-Zip failed"))
+        output = [l.strip() for l in done.stdout.decode("utf-8", "replace").splitlines() if l.strip()]
+        errors = [l for l in output if "error" in l.lower()]
+        raise InstallError("can't unpack %s: %s" % (name, errors[-1] if errors else "7-Zip couldn't read it"))
     # 7-Zip keeps paths inside the folder, but check anyway, and refuse links: they could point anywhere.
     real = os.path.realpath(target)
     for dirpath, dirs, names in os.walk(target):
