@@ -749,24 +749,17 @@ GAMEINFO_FOLDERS = ("hl2_complete", "hl2")
 def search_paths_block(text):
     """The lines inside gameinfo.txt's SearchPaths { }, without comments, or None. Braces are
     counted, so a nested block or a stray brace doesn't end it early."""
-    lines = [line.split("//")[0] for line in text.splitlines()]
-    for i, line in enumerate(lines):
-        if not re.match(r'\s*"?SearchPaths"?\s*(\{|$)', line, re.IGNORECASE):
-            continue
-        rest = [line.split("SearchPaths", 1)[-1].split("searchpaths", 1)[-1]] + lines[i + 1:]
-        depth, block = 0, []
-        for part in rest:
-            for piece in re.split(r"([{}])", part):
-                if piece == "{":
-                    depth += 1
-                elif piece == "}":
-                    depth -= 1
-                    if depth == 0:
-                        return block
-                elif depth >= 1 and piece.strip():
-                    block.append(piece)
-        return block
-    return None
+    text = "\n".join(line.split("//")[0] for line in text.splitlines())
+    m = re.search(r'"?SearchPaths"?\s*\{', text, re.IGNORECASE)
+    if not m:
+        return None
+    depth, end = 1, m.end()
+    while end < len(text):
+        depth += {"{": 1, "}": -1}.get(text[end], 0)
+        if depth == 0:
+            break
+        end += 1
+    return [line for line in re.split(r"[{}\n]", text[m.end():end]) if line.strip()]
 
 
 def gameinfo_search_paths(game_dir, folders=GAMEINFO_FOLDERS):

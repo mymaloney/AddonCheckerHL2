@@ -17,6 +17,8 @@
 - `exec "a.cfg"` and `exec a.cfg` count as the same command.
 - Lists scripts that use sounds, models or materials the original game doesn't have;
   `--original-files-only` leaves those addons out of `combined/`.
+- The report lists the original game's VPKs and loose folders it read, and VPKs `gameinfo.txt`
+  names that aren't there; loose game files count as the original game's.
 
 ## 1.0.0 (2026-10-12)
 

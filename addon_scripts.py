@@ -114,25 +114,39 @@ def read_addon_texts(addon, want):
     return out, errors
 
 
+def base_sources(game_dir):
+    """Where the original game's files are, in the game's order: (VPKs and loose folders,
+    VPKs gameinfo.txt names that aren't there)."""
+    search, gameinfo = ac.gameinfo_search_paths(game_dir)
+    if not gameinfo:
+        folders = [os.path.join(game_dir, f) for f in ac.FALLBACK_GAME_FOLDERS]
+        return ac.fallback_vpks(game_dir) + [f for f in folders if os.path.isdir(f)], []
+    sources, not_found = [], []
+    for _keys, path in search:
+        name = os.path.basename(path).lower()
+        if name == "*" or name == "download":
+            continue  # custom/* holds addons; download/ holds files servers sent
+        if path.lower().endswith(".vpk"):
+            for cand in (path[:-4] + "_dir.vpk", path):
+                if os.path.isfile(cand):
+                    sources.append(cand)
+                    break
+            else:
+                not_found.append(os.path.relpath(path, game_dir))
+        elif os.path.isdir(path) and path not in sources:
+            sources.append(path)
+    return sources, not_found
+
+
+def on_disk(sources, path):
+    """Whether one of the game's loose folders has path."""
+    return any(os.path.isfile(os.path.join(d, *path.split("/"))) for d in sources if os.path.isdir(d))
+
+
 def base_game_texts(game_dir, paths):
     """The original game's copies of paths, as the game finds them without addons:
     ({path: bytes}, [errors])."""
-    search, gameinfo = ac.gameinfo_search_paths(game_dir)
-    sources = []
-    if gameinfo:
-        for _keys, path in search:
-            name = os.path.basename(path).lower()
-            if name == "*" or name == "download":
-                continue  # custom/* holds addons; download/ holds files servers sent
-            if path.lower().endswith(".vpk"):
-                for cand in (path[:-4] + "_dir.vpk", path):
-                    if os.path.isfile(cand):
-                        sources.append(cand)
-                        break
-            elif os.path.isdir(path):
-                sources.append(path)
-    else:
-        sources = ac.fallback_vpks(game_dir)
+    sources = base_sources(game_dir)[0]
     out, errors, left = {}, [], set(paths)
     for source in sources:
         if not left:
@@ -664,6 +678,7 @@ def extract(addons, game_dir, out_dir, materials=False, progress=None, original_
     parsed_base = {p: Parsed(p, d) for p, d in base.items()}
     parsed = {a: {p: Parsed(p, d) for p, d in texts[a].items()} for a in order}
     game_files = set(ac.read_base_game(game_dir, slow=None)[0]) if game_dir else None
+    sources, not_found = base_sources(game_dir) if game_dir else ([], [])
     owner = {}
     for a in order:
         for p in a.files:
@@ -676,7 +691,8 @@ def extract(addons, game_dir, out_dir, materials=False, progress=None, original_
                 if x.text is not None:
                     orig = parsed_base.get(path)
                     refs |= asset_refs(x.text) - (asset_refs(orig.text) if orig and orig.text else set())
-            found = {r: (a if r in a.files else owner.get(r)) for r in sorted(refs) if r not in game_files}
+            found = {r: (a if r in a.files else owner.get(r)) for r in sorted(refs)
+                     if r not in game_files and not on_disk(sources, r)}
             if found:
                 custom[a] = found
 
@@ -687,8 +703,15 @@ def extract(addons, game_dir, out_dir, materials=False, progress=None, original_
             shutil.rmtree(os.path.join(out_dir, sub), ignore_errors=True)
     os.makedirs(out_dir, exist_ok=True)
 
+    vpks = [os.path.relpath(x, game_dir) for x in sources if not os.path.isdir(x)] if game_dir else []
     report = ["HL2 Addon Scripts %s" % ac.__version__,
-              "Compared with: " + base_info, "",
+              "Compared with: " + base_info]
+    if game_dir:
+        report.append("  %s read: %s" % (ac.plural(len(vpks), "VPK"), ", ".join(vpks)))
+        report.append("  loose folders: " + ", ".join(os.path.relpath(x, game_dir) for x in sources if os.path.isdir(x)))
+        if not_found:
+            report.append("  named in gameinfo.txt but not there: " + ", ".join(not_found))
+    report += ["",
               "What every addon changes in the game's scripts and settings, and one folder with all of",
               "them combined (combined/). Models, materials, sounds and maps are counted, not copied.",
               "Addons are listed in load order: an addon further down loads later and wins.", ""]

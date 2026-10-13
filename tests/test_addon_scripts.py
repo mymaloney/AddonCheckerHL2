@@ -341,6 +341,7 @@ class EndToEnd(Base):
         self.assertIn("       sound/weapons/gone.wav  (missing)\n       sound/weapons/new.wav  (its own)", report)
         self.assertNotIn("pistol/fire.wav  (", report)  # the original game has it
         self.assertNotIn("never_shipped", report)  # the original script already names it
+        self.assertIn("  1 VPK read: " + os.path.join("hl2", "hl2_pak_dir.vpk"), report)
         self.assertIn("1 addon's scripts use sounds", out)
         self.assertTrue(os.path.isfile(self.path("out", "combined", "scripts", "game_sounds_new.txt")))
 
@@ -349,6 +350,27 @@ class EndToEnd(Base):
         self.assertIn("Left out of combined/ (--original-files-only).", self.read("report.txt"))
         self.assertFalse(os.path.exists(self.path("out", "combined", "scripts", "game_sounds_new.txt")))
         self.assertTrue(os.path.isfile(self.path("out", "addons", "006 workshop_666", "scripts", "game_sounds_new.txt")))
+
+    def test_loose_game_files_count_as_the_original_game(self):
+        game = self.setup_install()
+        write(os.path.join(game, "hl2", "sound", "weapons", "gone.wav"), "RIFF")
+        self.run_tool("--game-dir", game)
+        self.assertIn("  workshop/666: 1 file (1 its own)\n", self.read("report.txt"))
+
+    def test_gameinfo_sources_are_listed(self):
+        gameinfo = ('"GameInfo" { FileSystem { SearchPaths {\n game+mod hl2/custom/*\n'
+                    ' game |all_source_engine_paths|hl2/hl2_pak.vpk\n game hl2/gone_pak.vpk\n'
+                    ' game |all_source_engine_paths|hl2\n } } }')
+        lib, game, workshop = self.library(gameinfo=gameinfo, base_files={"scripts/a.txt": b"x"},
+                                           items={"1": {"scripts/b.txt": '"S" { "wave" "weapons/loose.wav" }'}},
+                                           order=[("1", 1)])
+        write(os.path.join(game, "hl2", "sound", "weapons", "loose.wav"), "RIFF")
+        self.run_tool("--game-dir", game)
+        report = self.read("report.txt")
+        self.assertIn("  1 VPK read: " + os.path.join("hl2", "hl2_pak_dir.vpk"), report)
+        self.assertIn("  loose folders: hl2\n", report)
+        self.assertIn("  named in gameinfo.txt but not there: " + os.path.join("hl2", "gone_pak.vpk"), report)
+        self.assertIn("doesn't have:\n  none", report)  # loose.wav is a loose game file
 
     def test_materials_option(self):
         game = self.setup_install()
