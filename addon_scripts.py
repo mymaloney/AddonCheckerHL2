@@ -122,10 +122,10 @@ def base_sources(game_dir):
         folders = [os.path.join(game_dir, f) for f in ac.FALLBACK_GAME_FOLDERS]
         return ac.fallback_vpks(game_dir) + [f for f in folders if os.path.isdir(f)], []
     sources, not_found = [], []
-    for _keys, path in search:
+    for keys, path in search:
         name = os.path.basename(path).lower()
-        if name == "*" or name == "download":
-            continue  # custom/* holds addons; download/ holds files servers sent
+        if name == "*" or name == "download" or keys == "gamebin":
+            continue  # custom/* holds addons; download/ files servers sent; gamebin the game's DLLs
         if path.lower().endswith(".vpk"):
             for cand in (path[:-4] + "_dir.vpk", path):
                 if os.path.isfile(cand):

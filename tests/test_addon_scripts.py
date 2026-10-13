@@ -360,11 +360,12 @@ class EndToEnd(Base):
     def test_gameinfo_sources_are_listed(self):
         gameinfo = ('"GameInfo" { FileSystem { SearchPaths {\n game+mod hl2/custom/*\n'
                     ' game |all_source_engine_paths|hl2/hl2_pak.vpk\n game hl2/gone_pak.vpk\n'
-                    ' game |all_source_engine_paths|hl2\n } } }')
+                    ' gamebin hl2/bin\n game |all_source_engine_paths|hl2\n } } }')
         lib, game, workshop = self.library(gameinfo=gameinfo, base_files={"scripts/a.txt": b"x"},
                                            items={"1": {"scripts/b.txt": '"S" { "wave" "weapons/loose.wav" }'}},
                                            order=[("1", 1)])
         write(os.path.join(game, "hl2", "sound", "weapons", "loose.wav"), "RIFF")
+        os.makedirs(os.path.join(game, "hl2", "bin"), exist_ok=True)
         self.run_tool("--game-dir", game)
         report = self.read("report.txt")
         self.assertIn("  1 VPK read: " + os.path.join("hl2", "hl2_pak_dir.vpk"), report)
