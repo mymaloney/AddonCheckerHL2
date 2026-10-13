@@ -3,6 +3,14 @@
 > ⚠️ This project was **vibe-coded**: written largely by an AI model, directed and tested by a person.
 > Read the warnings at the top of the [README](README.md) before using it.
 
+## Unreleased
+
+### Scripts and settings (`addon_scripts.py`, new)
+- Copies the scripts and settings (text files) out of every loaded addon, shows what each one
+  changes compared with the original game, setting by setting, and combines them all into one folder
+  (`combined/`), the later-loading addon winning where two set the same thing. For mod makers.
+- Organizer: Tools > Extract scripts and settings....
+
 ## 1.0.0 (2026-10-12)
 
 First public release. Public domain ([The Unlicense](LICENSE)).
