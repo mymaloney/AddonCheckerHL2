@@ -226,20 +226,29 @@ python addon_scripts.py                  # results go to addon_scripts/
 ```
 
 It only copies text files: `scripts/` (weapons, sounds, soundscapes, `propdata`,
-`surfaceproperties`...), `cfg/`, `resource/` (HUD and menus) and other `.txt`/`.cfg`/`.res` files.
-Models, materials, sounds and maps are counted per addon, not copied.
+`surfaceproperties`...), `cfg/`, `resource/` (HUD and menus), other `.txt`/`.cfg`/`.res` files, and
+map entity patches (`maps/<map>_l_0.lmp`, which change a map's entities without replacing the map).
+Models, materials, sounds and whole maps are counted per addon, not copied.
 
 - **`report.txt`**: every addon in load order, and what each file changes compared with the
   original game, setting by setting (`weapondata/clip_size: "18" -> "25"`). Files the original game
-  doesn't have are listed as new; ones identical to it are marked as such. Text files that aren't
-  settings files get a line-by-line diff.
+  doesn't have are listed as new, with what's in them; ones identical to it are marked as such. Text
+  files that aren't settings files get a line-by-line diff. The same change made in many places (one
+  setting changed in 500 sounds) is listed once, with how many places and a few of them.
+- Entity patches are compared with the original map's entities, entity by entity (by Hammer id,
+  or name or position).
 - **`addons/`**: each addon's files as they are, one folder per addon, numbered in load order.
 - **`combined/`**: every changed file, ready to copy into a mod. In the game, an addon's copy of a
   file replaces the whole file; here, settings files (KeyValues like `scripts/*.txt`, and `.cfg`
   files) changed by several addons are combined setting by setting. Where two addons set the same
-  thing, the one that loads later wins, and `report.txt` lists each of those conflicts. Other files
-  changed by several addons are taken whole from the addon that loads later. Combined files lose their
-  comments; files only one addon changes are copied as they are.
+  thing, the one that loads later wins, and `report.txt` lists each of those conflicts. In lists the
+  game picks from at random (`rndwave`) and entity outputs (`OnTrigger`...), entries from every addon
+  are kept. Other files changed by several addons are taken whole from the addon that loads later.
+  Combined files lose their comments; files only one addon changes are copied as they are.
+- The combined folder is *not* what the game does: there, only the later-loading addon's copy of a
+  file is used, and `report.txt` says whose for each combined file. It also can't fix your own game:
+  `custom/` addons load before every Workshop addon, so a combined file there loses to the Workshop
+  copies. It's for building a mod from.
 - A `.cfg` that leaves out a command doesn't count as removing it, so a small `skill.cfg` doesn't
   wipe the original's settings from the combined one.
 - Only the addons the game loads are included (`--all` adds disabled ones). The organizer's
@@ -253,7 +262,7 @@ Models, materials, sounds and maps are counted per addon, not copied.
 | `--all` | Also include disabled addons |
 | `--game-dir FOLDER`, `--offline` | As for the checker |
 
-Not handled: entity changes inside maps (`.bsp`), and binary files like particles (`.pcf`) or
+Not handled: entities inside replaced maps (`.bsp`), and binary files like particles (`.pcf`) or
 compiled captions (`.dat`).
 
 ## Tests

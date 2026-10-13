@@ -10,6 +10,11 @@
   changes compared with the original game, setting by setting, and combines them all into one folder
   (`combined/`), the later-loading addon winning where two set the same thing. For mod makers.
 - Organizer: Tools > Extract scripts and settings....
+- Map entity patches (`.lmp`) are compared with the original map's entities and combined entity by
+  entity.
+- New files are listed with what's in them; the same change in many places is listed once.
+- Random sound lists (`rndwave`) and entity outputs keep every addon's entries when combined.
+- `exec "a.cfg"` and `exec a.cfg` count as the same command.
 
 ## 1.0.0 (2026-10-12)
 

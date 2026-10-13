@@ -49,6 +49,32 @@ def split_vpk(folder, name, files, preload=0):
     write(os.path.join(folder, name + "_000.vpk"), bytes(blob))
 
 
+ENTITIES = """{
+"classname" "worldspawn"
+"hammerid" "1"
+}
+{
+"classname" "logic_relay"
+"hammerid" "42"
+"targetname" "start_relay"
+"OnTrigger" "alyx,SpeakResponseConcept,TLK_A,0,-1"
+}
+"""
+
+
+def bsp_bytes(entities):
+    """A compiled map holding only its entity lump."""
+    body = entities.encode() + b"\0"
+    header = b"VBSP" + struct.pack("<i", 20)
+    offset = len(header) + 64 * 16 + 4
+    lumps = struct.pack("<iiii", offset, len(body), 0, 0) + b"\0" * (63 * 16)
+    return header + lumps + struct.pack("<i", 1) + body
+
+
+def lmp_bytes(entities):
+    return sc.entities_lmp(entities, 0, 7)
+
+
 def parse(text):
     return sc.flatten_kv(sc.parse_kv(text))
 
@@ -80,6 +106,24 @@ class KeyValues(unittest.TestCase):
         pairs = sc.parse_kv(PISTOL)
         self.assertEqual(sc.parse_kv("\n".join(sc.format_kv(pairs))), pairs)
 
+    def test_random_sound_lists_are_sets(self):
+        base = parse('"S" { "rndwave" { "wave" "a.wav" "wave" "b.wav" } }')
+        one = parse('"S" { "rndwave" { "wave" "a.wav" "wave" "b.wav" "wave" "one.wav" } }')
+        two = parse('"S" { "rndwave" { "wave" "A.WAV" "wave" "b.wav" "wave" "two.wav" } }')
+        merged, conflicts = sc.merge_settings(base, [("one", one), ("two", two)])
+        waves = sorted(v.lower() for _, _, v in merged.values() if v is not sc.BLOCK)
+        self.assertEqual(waves, ["a.wav", "b.wav", "one.wav", "two.wav"])
+        self.assertEqual(conflicts, [])
+        self.assertEqual(sc.describe(sc.diff_settings(base, one), "kv"), ['+ s/rndwave/wave = "one.wav"'])
+
+    def test_the_same_change_in_many_places_is_one_line(self):
+        names = ["Snd.%d" % i for i in range(7)]
+        old = parse("".join('"%s" { "channel" "CHAN_VOICE" }' % n for n in names))
+        new = parse("".join('"%s" { "channel" "CHAN_STATIC" }' % n for n in names[:6]) + '"Snd.6" { "channel" "CHAN_ITEM" }')
+        lines = sc.describe(sc.diff_settings(old, new), "kv")
+        self.assertEqual(lines, ['channel: "CHAN_VOICE" -> "CHAN_STATIC"  in 6 places: snd.0, snd.1, snd.2, ...',
+                                 'snd.6/channel: "CHAN_VOICE" -> "CHAN_ITEM"'])
+
     def test_diff(self):
         new = parse(PISTOL.replace('"18"', '"25"').replace('\t"damage"\t"8"\n', "")
                     .replace("SoundData", 'Extra { "a" "1" }\n\tSoundData'))
@@ -100,6 +144,10 @@ class Cfg(unittest.TestCase):
         self.assertIn('bind "F" "impulse 100"', shown)
         self.assertIn('bind g "+use"', shown)
         self.assertEqual(shown.count("echo hi"), 2)
+
+    def test_quoted_and_unquoted_exec_are_the_same(self):
+        old, new = sc.parse_cfg("exec skill.cfg\n"), sc.parse_cfg('exec "skill.cfg"\nexec "mine.cfg"\n')
+        self.assertEqual(sc.describe(sc.diff_settings(old, new, False), "cfg"), ["+ exec mine.cfg"])
 
 
 class Merging(unittest.TestCase):
@@ -128,6 +176,20 @@ class Merging(unittest.TestCase):
         a = parse(PISTOL.replace('\t"damage"\t"8"\n', ""))
         merged, _ = sc.merge_settings(base, [("A", a)])
         self.assertNotIn((("weapondata", 1), ("damage", 1)), merged)
+
+
+class Entities(unittest.TestCase):
+    def test_entity_patch(self):
+        parsed = sc.Parsed("maps/m_l_0.lmp", lmp_bytes(ENTITIES))
+        self.assertEqual(parsed.kind, "ents")
+        self.assertEqual(parsed.flat[(("logic_relay #42", 1), ("targetname", 1))][2], "start_relay")
+        self.assertEqual(sc.parse_entities(sc.bsp_entities(bsp_bytes(ENTITIES)).decode()),
+                         sc.parse_entities(ENTITIES))
+
+    def test_round_trip(self):
+        flat = sc.flatten_entities(sc.parse_entities(ENTITIES))
+        again = sc.Parsed("maps/m_l_0.lmp", sc.entities_lmp("\n".join(sc.format_entities(flat))))
+        self.assertEqual(again.flat, flat)
 
 
 class ReadingContents(Base):
@@ -162,15 +224,20 @@ class EndToEnd(Base):
     def setup_install(self):
         skill = "sk_plr_dmg_pistol 8\nsk_plr_dmg_smg1 4\n"
         lib, game, workshop = self.library(
-            base_files={"scripts/weapon_pistol.txt": PISTOL.encode(), "cfg/skill.cfg": skill.encode()},
+            base_files={"scripts/weapon_pistol.txt": PISTOL.encode(), "cfg/skill.cfg": skill.encode(),
+                        "maps/town.bsp": bsp_bytes(ENTITIES)},
             items={"111": {"scripts/weapon_pistol.txt": PISTOL.replace('"18"', '"25"').replace('"8"', '"12"'),
                            "models/gun.mdl": "\0mdl", "materials/gun.vmt": '"VertexLitGeneric" {}'},
                    "222": {"pak.vpk": vpk_bytes({
                        "scripts/weapon_pistol.txt": PISTOL.replace('"18"', '"30"').encode(),
                        "cfg/skill.cfg": b"sk_plr_dmg_pistol 8\nsk_plr_dmg_smg1 6\n",
                        "scripts/credits.txt": b"Made by someone"})},
-                   "333": {"scripts/weapon_pistol.txt": PISTOL.replace('"18"', '"99"')}},
-            order=[("111", 1), ("222", 1), ("333", 0)],
+                   "333": {"scripts/weapon_pistol.txt": PISTOL.replace('"18"', '"99"')},
+                   "444": {"maps/town_l_0.lmp": lmp_bytes(ENTITIES.replace("TLK_A", "TLK_B")),
+                           "cfg/custom_scripts/19.cfg": "r_drawdecals 1\n"},
+                   "555": {"maps/town_l_0.lmp": lmp_bytes(ENTITIES.replace('"start_relay"', '"go_relay"')),
+                           "cfg/custom_scripts/19.cfg": "cl_ragdoll_fade_time 99999\n"}},
+            order=[("111", 1), ("222", 1), ("333", 0), ("444", 1), ("555", 1)],
             custom={"hl2": {"my_mod": {"cfg/skill.cfg": "sk_plr_dmg_smg1 5\n"}}})
         return game
 
@@ -196,7 +263,14 @@ class EndToEnd(Base):
         self.assertIn('weapondata/clip_size: "18" -> "25"', report)
         self.assertIn('weapondata/damage: "8" -> "12"', report)
         self.assertIn('sk_plr_dmg_smg1: "4" -> "6"', report)
-        self.assertIn("scripts/credits.txt  (new file, 1 line)", report)
+        self.assertIn("scripts/credits.txt  (new file, 1 line)\n       + Made by someone", report)
+        self.assertIn("cfg/custom_scripts/19.cfg  (new file, 1 setting)\n       + r_drawdecals 1", report)
+        self.assertIn("(in the game, only workshop/555's copy is used)", report)
+        # Map entity patches, compared with the original map's entities
+        self.assertIn('maps/town_l_0.lmp  (2 changes)\n'
+                      '       + logic_relay #42/ontrigger = "alyx,SpeakResponseConcept,TLK_B,0,-1"\n'
+                      '       - logic_relay #42/ontrigger (was "alyx,SpeakResponseConcept,TLK_A,0,-1")', report)
+        self.assertIn('logic_relay #42/targetname: "start_relay" -> "go_relay"', report)
         self.assertIn("Also changes (not copied): 1 materials, 1 models", report)
         self.assertNotIn('"99"', report)  # 333 is turned off
         # Load order: custom/ first, then workshop.txt top to bottom; the later one wins.
@@ -215,6 +289,13 @@ class EndToEnd(Base):
         self.assertIn("sk_plr_dmg_pistol 8", skill)  # my_mod leaving it out doesn't take it away
         self.assertNotIn("- sk_plr_dmg_pistol", report)
         self.assertEqual(self.read("combined", "scripts", "credits.txt"), "Made by someone")
+        with open(self.path("out", "combined", "maps", "town_l_0.lmp"), "rb") as f:
+            town = sc.Parsed("maps/town_l_0.lmp", f.read())
+        relay = {k[1][0]: v[2] for k, v in town.flat.items() if k[0][0] == "logic_relay #42" and len(k) == 2}
+        self.assertEqual(relay["targetname"], "go_relay")  # 555's change
+        self.assertIn("alyx,SpeakResponseConcept,TLK_B,0,-1", relay.values())  # and 444's
+        self.assertNotIn("alyx,SpeakResponseConcept,TLK_A,0,-1", relay.values())
+        self.assertEqual(town.lump[4], 7)  # map revision kept
         self.assertFalse(os.path.exists(self.path("out", "combined", "materials")))
         self.assertTrue(any(n.endswith("workshop_111") or "111" in n for n in os.listdir(self.path("out", "addons"))))
 

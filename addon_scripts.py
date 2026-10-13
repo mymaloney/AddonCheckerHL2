@@ -24,6 +24,7 @@ import difflib
 import os
 import re
 import shutil
+import struct
 import sys
 import traceback
 from collections import Counter, OrderedDict
@@ -37,6 +38,7 @@ MATERIAL_EXTS = {"vmt"}
 MAX_TEXT = 8 * 1024 * 1024  # bigger "text" files are data dumps, not settings
 MAX_LISTED = 200  # changes listed per file in the report
 MAX_DIFF_LINES = 80
+GROUP_MIN = 5  # the same change in this many places is listed once
 
 # Commands that can appear many times in a .cfg, each a separate setting: the first argument
 # is part of what they set (bind KEY, alias NAME).
@@ -51,6 +53,8 @@ def wanted(path, materials=False):
     ext = path.rsplit(".", 1)[-1] if "." in path.rsplit("/", 1)[-1] else ""
     if ext in MATERIAL_EXTS:
         return materials
+    if ext == "lmp":
+        return path.startswith("maps/")  # map entity patches
     return ext in TEXT_EXTS
 
 
@@ -136,7 +140,7 @@ def base_game_texts(game_dir, paths):
                 if os.path.isfile(full):
                     try:
                         with open(full, "rb") as f:
-                            out[path] = f.read(MAX_TEXT + 1)
+                            out[path] = f.read() if path.endswith(".bsp") else f.read(MAX_TEXT + 1)
                     except OSError as e:
                         errors.append("%s: %s" % (full, ac.error_text(e)))
         else:
@@ -211,18 +215,22 @@ def parse_kv(text):
     return root
 
 
-def flatten_kv(pairs, prefix=(), out=None):
+def flatten_kv(pairs, prefix=(), out=None, as_set=False):
     """OrderedDict of path -> (key as written, condition, value or BLOCK). A path is a tuple of
-    (lower-case key + condition, occurrence) steps, so repeated keys stay apart."""
+    (lower-case key + condition, occurrence) steps, so repeated keys stay apart. In a list the
+    game picks from at random (rndwave), entries are told apart by their value instead
+    ("wave=a.wav"), so two addons that each add a sound both keep theirs."""
     out = OrderedDict() if out is None else out
     seen = Counter()
     for key, value, cond in pairs:
         name = key.lower() + (" " + cond.lower() if cond else "")
+        if as_set and not isinstance(value, list):
+            name += "=" + value.replace("\\", "/").lower()
         seen[name] += 1
         path = prefix + ((name, seen[name]),)
         if isinstance(value, list):
             out[path] = (key, cond, BLOCK)
-            flatten_kv(value, path, out)
+            flatten_kv(value, path, out, as_set=key.lower() == "rndwave")
         else:
             out[path] = (key, cond, value)
     return out
@@ -276,7 +284,7 @@ def parse_cfg(text):
                 name = cmd + " " + words[1].strip('"').lower()
                 shown, args = words[0] + " " + words[1], words[2] if len(words) > 2 else ""
             elif cmd in ACTION_COMMANDS:
-                name, shown, args = part.lower(), part, ""
+                name, shown, args = " ".join(part.replace('"', "").lower().split()), part, ""
             else:
                 name, shown, args = cmd, words[0], part.split(None, 1)[1] if len(words) > 1 else ""
             seen[name] += 1
@@ -312,13 +320,114 @@ def format_cfg(flat):
     return [(shown + " " + args).rstrip() for shown, _, args in flat.values()]
 
 
+LUMP_HEADER = struct.Struct("<5i")  # data offset, lump id, lump version, length, map revision
+
+
+def lmp_entities(data):
+    """The entity text of a map's entity patch (maps/<map>_l_0.lmp), or None."""
+    if len(data) < LUMP_HEADER.size:
+        return None
+    offset, lump, _version, length, _revision = LUMP_HEADER.unpack_from(data)
+    if lump != 0 or offset < LUMP_HEADER.size:
+        return None  # only the entity lump (0) is text
+    return data[offset:offset + length].split(b"\0", 1)[0]
+
+
+def bsp_entities(data):
+    """The entity text of a compiled map (.bsp), or None."""
+    if data[:4] != b"VBSP" or len(data) < 16:
+        return None
+    offset, length = struct.unpack_from("<ii", data, 8)
+    return data[offset:offset + length].split(b"\0", 1)[0] or None
+
+
+def entities_lmp(text, version=0, revision=0):
+    body = text.encode("utf-8", "replace") + b"\0"
+    return LUMP_HEADER.pack(LUMP_HEADER.size, 0, version, len(body), revision) + body
+
+
+def parse_entities(text):
+    """A map's entities as a list of [[key, value, ""]...], or None."""
+    entities, current, key = [], None, None
+    for m in KV_TOKEN.finditer(text):
+        quoted, _cond, brace, bare = m.groups()
+        if brace == "{":
+            if current is not None:
+                return None
+            current = []
+        elif brace == "}":
+            if current is None or key is not None:
+                return None
+            entities.append(current)
+            current = None
+        elif quoted is not None or bare is not None:
+            if current is None:
+                return None
+            token = quoted if quoted is not None else bare
+            if key is None:
+                key = token
+            else:
+                current.append([key, token, ""])
+                key = None
+    return entities if current is None else None
+
+
+def entity_name(pairs):
+    keys = {}
+    for k, v, _ in pairs:
+        keys.setdefault(k.lower(), v)
+    name = keys.get("classname", "entity")
+    if keys.get("hammerid"):
+        return "%s #%s" % (name, keys["hammerid"])
+    if keys.get("targetname"):
+        return '%s "%s"' % (name, keys["targetname"])
+    if keys.get("origin"):
+        return "%s at (%s)" % (name, keys["origin"])
+    return name
+
+
+def flatten_entities(entities):
+    """Like flatten_kv: one block per entity, named by its class and Hammer id (or name or
+    place). Outputs (OnTrigger...) can repeat, so they're told apart by their value."""
+    out, seen = OrderedDict(), Counter()
+    for pairs in entities:
+        name = entity_name(pairs)
+        seen[name] += 1
+        path = ((name, seen[name]),)
+        out[path] = (name, "", BLOCK)
+        keys = Counter()
+        for key, value, _ in pairs:
+            step = key.lower() + ("=" + value.lower() if key.lower().startswith("on") else "")
+            keys[step] += 1
+            out[path + ((step, keys[step]),)] = (key, "", value)
+    return out
+
+
+def format_entities(flat):
+    lines = []
+    for _name, pairs, _ in unflatten_kv(flat):
+        lines.append("{")
+        lines += ["%s %s" % (quote(k), quote(v)) for k, v, _ in pairs if not isinstance(v, list)]
+        lines.append("}")
+    return lines
+
+
 class Parsed:
-    """A text file read as settings: kind is "kv" or "cfg", flat the settings; or kind "text"."""
+    """A text file read as settings: kind is "kv", "cfg" or "ents" (map entities), flat the
+    settings; or kind "text" or "binary"."""
 
     def __init__(self, path, data):
         self.data = data
-        self.text, self.encoding = decode(data)
         self.kind, self.flat = "binary", None
+        if path.endswith(".lmp"):
+            raw = lmp_entities(data)
+            self.text, self.encoding = decode(raw) if raw is not None else (None, None)
+            entities = parse_entities(self.text) if self.text is not None else None
+            if entities is not None:
+                self.kind, self.flat = "ents", flatten_entities(entities)
+                self.lump = LUMP_HEADER.unpack_from(data)
+            return
+        self.text, self.encoding = decode(data)
         if self.text is None:
             return
         self.kind = "text"
@@ -331,7 +440,8 @@ class Parsed:
 
 
 def show_path(path):
-    return "/".join(name if n == 1 else "%s[%d]" % (name, n) for name, n in path)
+    """weapondata/clip_size; rndwave entries without their "=value"."""
+    return "/".join(name.partition("=")[0] + ("" if n == 1 else "[%d]" % n) for name, n in path)
 
 
 def show_value(value):
@@ -355,17 +465,46 @@ def diff_settings(old, new, removals=True):
     return changes
 
 
+def describe_one(what, name, old, new, kind):
+    if what == "changed":
+        return "%s: %s -> %s" % (name, show_value(old), show_value(new))
+    if what == "added":
+        if kind == "cfg":
+            return ("+ %s %s" % (name, new)).rstrip()
+        return "+ %s = %s" % (name, show_value(new))
+    return "- %s (was %s)" % (name, show_value(old))
+
+
 def describe(changes, kind):
-    lines = []
+    """Report lines for changes. The same change to the same setting in many places (a sound
+    property changed in 500 sounds) is one line, with a few of the places."""
+    def group(what, path, old, new):
+        return (what, path[-1][0].partition("=")[0], old, new) if len(path) > 1 and kind != "cfg" else None
+    places = OrderedDict()
+    for c in changes:
+        g = group(*c)
+        if g:
+            places.setdefault(g, []).append(show_path(c[1][:-1]))
+    lines, done = [], set()
     for what, path, old, new in changes:
-        name = show_path(path) if kind == "kv" else path[0][0]
-        if what == "changed":
-            lines.append("%s: %s -> %s" % (name, show_value(old), show_value(new)))
-        elif what == "added":
-            lines.append("+ %s = %s" % (name, show_value(new)))
-        else:
-            lines.append("- %s (was %s)" % (name, show_value(old)))
+        g = group(what, path, old, new)
+        if g and len(places[g]) >= GROUP_MIN:
+            if g not in done:
+                done.add(g)
+                lines.append("%s  in %d places: %s, ..." % (
+                    describe_one(what, g[1], old, new, kind), len(places[g]), ", ".join(places[g][:3])))
+            continue
+        lines.append(describe_one(what, show_path(path) if kind != "cfg" else path[0][0], old, new, kind))
     return lines
+
+
+def listing(parsed):
+    """Report lines for a file the original game doesn't have: what it contains."""
+    if parsed.flat is None:
+        lines = ["+ " + line for line in parsed.text.splitlines() if line.strip()]
+        return lines[:MAX_DIFF_LINES] + (["... (see the file itself)"] if len(lines) > MAX_DIFF_LINES else [])
+    return describe([("added", p, None, v) for p, (_, _, v) in parsed.flat.items()
+                     if v is not BLOCK or parsed.kind == "cfg"], parsed.kind)
 
 
 def text_diff(old, new, path):
@@ -467,7 +606,12 @@ def extract(addons, game_dir, out_dir, materials=False, progress=None):
     base, base_errors, base_info = {}, [], "not compared (Half-Life 2 folder not found)"
     if game_dir:
         progress(len(order), len(order), "the original game files")
-        base, base_errors = base_game_texts(game_dir, paths)
+        maps = {p: re.sub(r"_l_\d+\.lmp$", ".bsp", p) for p in paths if p.endswith(".lmp")}
+        base, base_errors = base_game_texts(game_dir, [maps.get(p, p) for p in paths])
+        for lmp, bsp in maps.items():  # an entity patch changes the original map's entities
+            text = bsp_entities(base.pop(bsp)) if bsp in base else None
+            if text is not None:
+                base[lmp] = entities_lmp(text.decode("utf-8", "replace"))
         base_info = "%s (%d of %d files are also in the original game)" % (game_dir, len(base), len(paths))
     problems += ["original game: " + e for e in base_errors]
 
@@ -515,17 +659,21 @@ def extract(addons, game_dir, out_dir, materials=False, progress=None):
                 continue
             by_path.setdefault(path, []).append((a, mine))
             if orig is None or orig.kind == "binary":
-                count = len(mine.flat) if mine.flat is not None else len(mine.text.splitlines())
+                lines = listing(mine)
+                count = (len([v for _, _, v in mine.flat.values() if v is not BLOCK]) if mine.flat is not None
+                         else len(mine.text.splitlines()))
                 report.append("   %s  (new file, %s)" % (
                     path, ac.plural(count, "setting" if mine.flat is not None else "line")))
-                continue
-            if mine.flat is not None and orig.kind == mine.kind:
-                changes = diff_settings(orig.flat, mine.flat, mine.kind == "kv")
+            elif mine.flat is not None and orig.kind == mine.kind:
+                changes = diff_settings(orig.flat, mine.flat, mine.kind != "cfg")
                 if not changes:
                     report.append("   %s  (same settings as the original game, written differently)" % path)
                     continue
                 report.append("   %s  (%s)" % (path, ac.plural(len(changes), "change")))
                 lines = describe(changes, mine.kind)
+            elif mine.text is None:
+                report.append("   %s  (changed, can't be read as text)" % path)
+                continue
             else:
                 lines = text_diff(orig.text, mine.text, path)[2:]
                 report.append("   %s  (changed, %d lines differ)" % (
@@ -556,14 +704,19 @@ def extract(addons, game_dir, out_dir, materials=False, progress=None):
         same_kind = last.flat is not None and all(p.kind == last.kind for _, p in versions)
         if same_kind and (orig is None or orig.kind == last.kind):
             merged, conflicts = merge_settings(orig.flat if orig else None, [(a, p.flat) for a, p in versions],
-                                               last.kind == "kv")
-            header = "// Combined by HL2 Addon Scripts from: " + names
-            lines = format_kv(unflatten_kv(merged)) if last.kind == "kv" else format_cfg(merged)
-            write_file(target, encode(lines, last.encoding, header))
+                                               last.kind != "cfg")
+            if last.kind == "ents":
+                _, _, version, _, revision = last.lump
+                write_file(target, entities_lmp("\n".join(format_entities(merged)) + "\n", version, revision))
+            else:
+                header = "// Combined by HL2 Addon Scripts from: " + names
+                lines = format_kv(unflatten_kv(merged)) if last.kind == "kv" else format_cfg(merged)
+                write_file(target, encode(lines, last.encoding, header))
             report.append("%s: combined from %s" % (path, names))
+            report.append("    (in the game, only %s's copy is used)" % label[versions[-1][0]])
             for p, a1, v1, a2, v2 in conflicts:
                 conflict_count += 1
-                name = show_path(p) if last.kind == "kv" else p[0][0]
+                name = show_path(p) if last.kind != "cfg" else p[0][0]
                 report.append("    %s: %s sets %s, %s sets %s -> %s wins" % (
                     name, label[a1], "(removed)" if v1 is None else show_value(v1),
                     label[a2], "(removed)" if v2 is None else show_value(v2), label[a2]))
