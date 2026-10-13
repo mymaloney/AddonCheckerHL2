@@ -527,6 +527,30 @@ def text_diff(old, new, path):
 
 
 # ---------------------------------------------------------------------------
+# Files scripts refer to
+# ---------------------------------------------------------------------------
+
+ASSET_REF = re.compile(r'[^\s"\'=,{}]+?\.(?:wav|mp3|ogg|mdl|vmt|vtf)\b', re.IGNORECASE)
+SOUND_CHARS = "*#@<>^)(}$!?~&`"  # sound script prefixes that say how to play the sound
+
+
+def asset_path(ref):
+    """The game file a reference in a script means: *vo/a.wav -> sound/vo/a.wav."""
+    ref = ref.replace("\\", "/").lower().lstrip("/")
+    ext = ref.rsplit(".", 1)[-1]
+    if ext in ("wav", "mp3", "ogg"):
+        ref = ref.lstrip(SOUND_CHARS).replace("$gender", "male")  # citizens: male01 or female01
+        return ref if ref.startswith("sound/") else "sound/" + ref
+    folder = "models/" if ext == "mdl" else "materials/"
+    return ref if ref.startswith(folder) else folder + ref
+
+
+def asset_refs(text):
+    """The sounds, models and materials a script names, as game paths."""
+    return {asset_path(m) for m in ASSET_REF.findall(re.sub(r"//[^\n]*", "", text))}
+
+
+# ---------------------------------------------------------------------------
 # Combining addons
 # ---------------------------------------------------------------------------
 
@@ -601,9 +625,11 @@ def encode(lines, encoding, header=None):
     return text.replace("\n", "\r\n").encode(encoding or "utf-8", "replace")
 
 
-def extract(addons, game_dir, out_dir, materials=False, progress=None):
+def extract(addons, game_dir, out_dir, materials=False, progress=None, original_only=False):
     """Writes the report, each addon's files and the combined folder to out_dir.
-    addons: the addons the game loads, ranked (lower rank wins). Returns a summary dict."""
+    addons: the addons the game loads, ranked (lower rank wins). original_only leaves addons
+    whose scripts use sounds, models or materials the original game doesn't have out of
+    combined/. Returns a summary dict."""
     progress = progress or (lambda *a: None)
     want = lambda p: wanted(p, materials)  # noqa: E731
     order = load_order_sorted(addons)
@@ -629,6 +655,24 @@ def extract(addons, game_dir, out_dir, materials=False, progress=None):
         base_info = "%s (%d of %d files are also in the original game)" % (game_dir, len(base), len(paths))
     problems += ["original game: " + e for e in base_errors]
 
+    # Which addons' scripts use sounds, models or materials the original game doesn't have.
+    parsed = {a: {p: Parsed(p, d) for p, d in texts[a].items()} for a in order}
+    game_files = set(ac.read_base_game(game_dir, slow=None)[0]) if game_dir else None
+    owner = {}
+    for a in order:
+        for p in a.files:
+            owner.setdefault(p, a)
+    custom = OrderedDict()  # addon -> {path: who has it (the addon, another addon, or None)}
+    if game_files:
+        for a in order:
+            refs = set()
+            for x in parsed[a].values():
+                if x.text is not None:
+                    refs |= asset_refs(x.text)
+            found = {r: (a if r in a.files else owner.get(r)) for r in sorted(refs) if r not in game_files}
+            if found:
+                custom[a] = found
+
     if os.path.isdir(out_dir) and os.listdir(out_dir):
         if not is_results_folder(out_dir):
             raise OutputFolderInUse(out_dir)
@@ -645,6 +689,14 @@ def extract(addons, game_dir, out_dir, materials=False, progress=None):
     for n, a in enumerate(order, 1):
         report.append("%3d. %s" % (n, label[a]))
     report.append("")
+    if game_files is not None:
+        report.append("Scripts that use sounds, models or materials the original game doesn't have%s:" % (
+            " (left out of combined/)" if original_only else ""))
+        for a, found in custom.items():
+            report.append("  %s: %s" % (label[a], ref_summary(a, found)))
+        if not custom:
+            report.append("  none")
+        report.append("")
 
     by_path = {}  # path -> [(addon, Parsed)] of addons that change it, in load order
     copied = 0
@@ -660,18 +712,30 @@ def extract(addons, game_dir, out_dir, materials=False, progress=None):
         files = texts[a]
         if not files:
             report.append("   No scripts or settings.")
+        if a in custom:
+            found = custom[a]
+            report.append("   Uses files the original game doesn't have: " + ref_summary(a, found))
+            for ref in list(found)[:MAX_DIFF_LINES]:
+                who = found[ref]
+                report.append("       %s  (%s)" % (ref, "its own" if who is a else
+                                                       "from " + label[who] if who else "missing"))
+            if len(found) > MAX_DIFF_LINES:
+                report.append("       ... and %d more" % (len(found) - MAX_DIFF_LINES))
+            if original_only:
+                report.append("   Left out of combined/ (--original-files-only).")
         for path in sorted(files):
             data = files[path]
             write_file(os.path.join(folder, *path.split("/")), data[:MAX_TEXT])
             copied += 1
-            mine, orig = Parsed(path, data), parsed_base.get(path)
+            mine, orig = parsed[a][path], parsed_base.get(path)
             if mine.kind == "binary":
                 report.append("   %s  (not a text file)" % path)
                 continue
             if orig is not None and orig.data == data:
                 report.append("   %s  (same as the original game)" % path)
                 continue
-            by_path.setdefault(path, []).append((a, mine))
+            if not (original_only and a in custom):
+                by_path.setdefault(path, []).append((a, mine))
             if orig is None or orig.kind == "binary":
                 lines = listing(mine)
                 count = (len([v for _, _, v in mine.flat.values() if v is not BLOCK]) if mine.flat is not None
@@ -748,7 +812,19 @@ def extract(addons, game_dir, out_dir, materials=False, progress=None):
     with open(report_path, "w", encoding="utf-8") as f:
         f.write("\n".join(report))
     return {"report": report_path, "addons": len(order), "files": copied, "changed": len(by_path),
-            "shared": shared, "conflicts": conflict_count, "problems": problems}
+            "shared": shared, "conflicts": conflict_count, "problems": problems,
+            "custom": [label[a] for a in custom]}
+
+
+def ref_summary(addon, found):
+    own = sum(1 for who in found.values() if who is addon)
+    missing = sum(1 for who in found.values() if who is None)
+    parts = ["%d its own" % own] if own else []
+    if len(found) - own - missing:
+        parts.append("%d from other addons" % (len(found) - own - missing))
+    if missing:
+        parts.append("%d missing" % missing)
+    return "%s (%s)" % (ac.plural(len(found), "file"), ", ".join(parts))
 
 
 # ---------------------------------------------------------------------------
@@ -798,6 +874,9 @@ def main():
     ap.add_argument("--game-dir", metavar="FOLDER", help="the Half-Life 2 folder (default: found automatically)")
     ap.add_argument("--materials", action="store_true", help="also copy material settings (.vmt)")
     ap.add_argument("--all", action="store_true", help="also include disabled addons")
+    ap.add_argument("--original-files-only", action="store_true",
+                    help="leave addons whose scripts use sounds, models or materials the original game doesn't "
+                         "have out of combined/")
     ap.add_argument("--offline", action="store_true", help="don't look up Workshop item titles on Steam")
     ap.add_argument("--version", action="version", version="HL2 Addon Scripts " + ac.__version__)
     args = ap.parse_args()
@@ -815,7 +894,8 @@ def main():
         log("Half-Life 2 folder not found, so files aren't compared with the original game (use --game-dir).")
     try:
         summary = extract(addons, game, args.out, args.materials,
-                          progress=lambda i, n, name: log("  [%d/%d] %s" % (i, n, name)))
+                          progress=lambda i, n, name: log("  [%d/%d] %s" % (i, n, name)),
+                          original_only=args.original_files_only)
     except (OutputFolderInUse, OSError) as e:
         print("Can't write the results: %s" % (e if isinstance(e, OutputFolderInUse) else ac.error_text(e)))
         return 1
@@ -824,6 +904,11 @@ def main():
     print("%s change the original game; %s changed by more than one addon (%s)." % (
         ac.plural(summary["changed"], "file"), ac.plural(summary["shared"], "file"),
         ac.plural(summary["conflicts"], "conflict")))
+    if summary["custom"]:
+        n = len(summary["custom"])
+        print("%d %s use sounds, models or materials the original game doesn't have%s." % (
+            n, "addon's scripts" if n == 1 else "addons' scripts",
+            " (left out of combined/)" if args.original_files_only else "; see report.txt"))
     for p in summary["problems"]:
         print("Couldn't read " + p)
     print("Report:   " + os.path.abspath(summary["report"]))

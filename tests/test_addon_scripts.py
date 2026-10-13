@@ -184,6 +184,14 @@ class Merging(unittest.TestCase):
         self.assertNotIn((("weapondata", 1), ("damage", 1)), merged)
 
 
+class References(unittest.TestCase):
+    def test_paths_the_game_would_load(self):
+        refs = sc.asset_refs('"wave" "*^vo/npc/$gender01/hi.wav" // "wave" "old.wav"\n'
+                             '"viewmodel" "models/weapons/v_gun.mdl" "x" "weapons\\Shot.WAV" "$basetexture" "a.vtf"')
+        self.assertEqual(refs, {"sound/vo/npc/male01/hi.wav", "models/weapons/v_gun.mdl",
+                                "sound/weapons/shot.wav", "materials/a.vtf"})
+
+
 class Entities(unittest.TestCase):
     def test_entity_patch(self):
         parsed = sc.Parsed("maps/m_l_0.lmp", lmp_bytes(ENTITIES))
@@ -239,7 +247,7 @@ class EndToEnd(Base):
         skill = "sk_plr_dmg_pistol 8\nsk_plr_dmg_smg1 4\n"
         lib, game, workshop = self.library(
             base_files={"scripts/weapon_pistol.txt": PISTOL.encode(), "cfg/skill.cfg": skill.encode(),
-                        "maps/town.bsp": bsp_bytes(ENTITIES)},
+                        "maps/town.bsp": bsp_bytes(ENTITIES), "sound/weapons/pistol/fire.wav": b"RIFF"},
             items={"111": {"scripts/weapon_pistol.txt": PISTOL.replace('"18"', '"25"').replace('"8"', '"12"'),
                            "models/gun.mdl": "\0mdl", "materials/gun.vmt": '"VertexLitGeneric" {}'},
                    "222": {"pak.vpk": vpk_bytes({
@@ -247,11 +255,15 @@ class EndToEnd(Base):
                        "cfg/skill.cfg": b"sk_plr_dmg_pistol 8\nsk_plr_dmg_smg1 6\n",
                        "scripts/credits.txt": b"Made by someone"})},
                    "333": {"scripts/weapon_pistol.txt": PISTOL.replace('"18"', '"99"')},
+                   "666": {"scripts/game_sounds_new.txt": '"New.Shot" { "wave" "weapons/new.wav" }\n'
+                                                           '"Old.Shot" { "wave" "^weapons/pistol/fire.wav" }\n'
+                                                           '"Gone.Shot" { "wave" "weapons/gone.wav" }',
+                           "sound/weapons/new.wav": "RIFF"},
                    "444": {"maps/town_l_0.lmp": lmp_bytes(ENTITIES.replace("TLK_A", "TLK_B")),
                            "cfg/custom_scripts/19.cfg": "r_drawdecals 1\n"},
                    "555": {"maps/town_l_0.lmp": lmp_bytes(ENTITIES.replace('"start_relay"', '"go_relay"')),
                            "cfg/custom_scripts/19.cfg": "cl_ragdoll_fade_time 99999\n"}},
-            order=[("111", 1), ("222", 1), ("333", 0), ("444", 1), ("555", 1)],
+            order=[("111", 1), ("222", 1), ("333", 0), ("444", 1), ("555", 1), ("666", 1)],
             custom={"hl2": {"my_mod": {"cfg/skill.cfg": "sk_plr_dmg_smg1 5\n"}}})
         return game
 
@@ -312,6 +324,23 @@ class EndToEnd(Base):
         self.assertEqual(town.lump[4], 7)  # map revision kept
         self.assertFalse(os.path.exists(self.path("out", "combined", "materials")))
         self.assertTrue(any(n.endswith("workshop_111") or "111" in n for n in os.listdir(self.path("out", "addons"))))
+
+    def test_scripts_that_need_files_the_game_doesnt_have(self):
+        game = self.setup_install()
+        code, out = self.run_tool("--game-dir", game)
+        report = self.read("report.txt")
+        self.assertIn("Scripts that use sounds, models or materials the original game doesn't have:\n"
+                      "  workshop/666: 2 files (1 its own, 1 missing)\n\n", report)
+        self.assertIn("       sound/weapons/gone.wav  (missing)\n       sound/weapons/new.wav  (its own)", report)
+        self.assertNotIn("pistol/fire.wav  (", report)  # the original game has it
+        self.assertIn("1 addon's scripts use sounds", out)
+        self.assertTrue(os.path.isfile(self.path("out", "combined", "scripts", "game_sounds_new.txt")))
+
+        code, out = self.run_tool("--game-dir", game, "--original-files-only")
+        self.assertEqual(code, 0, out)
+        self.assertIn("Left out of combined/ (--original-files-only).", self.read("report.txt"))
+        self.assertFalse(os.path.exists(self.path("out", "combined", "scripts", "game_sounds_new.txt")))
+        self.assertTrue(os.path.isfile(self.path("out", "addons", "006 workshop_666", "scripts", "game_sounds_new.txt")))
 
     def test_materials_option(self):
         game = self.setup_install()

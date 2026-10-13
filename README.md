@@ -235,6 +235,10 @@ Models, materials, sounds and whole maps are counted per addon, not copied.
   doesn't have are listed as new, with what's in them; ones identical to it are marked as such. Text
   files that aren't settings files get a line-by-line diff. The same change made in many places (one
   setting changed in 500 sounds) is listed once, with how many places and a few of them.
+- It also lists the addons whose scripts use sounds, models or materials the original game doesn't
+  have, and for each file whether the addon brings it, another addon does, or nobody does
+  (missing). A combined folder that keeps those scripts only works with those files too;
+  `--original-files-only` leaves those addons out of it.
 - Entity patches are compared with the original map's entities, entity by entity (by Hammer id,
   or name or position).
 - **`addons/`**: each addon's files as they are, one folder per addon, numbered in load order.
@@ -259,6 +263,7 @@ Models, materials, sounds and whole maps are counted per addon, not copied.
 | `python addon_scripts.py FOLDER ...` | Use these addon folders instead |
 | `--out FOLDER` | Where the results go (default `addon_scripts`). It must be empty or hold earlier results, which are replaced. |
 | `--materials` | Also copy material settings (`.vmt`) |
+| `--original-files-only` | Leave addons whose scripts use sounds, models or materials the original game doesn't have out of `combined/` |
 | `--all` | Also include disabled addons |
 | `--game-dir FOLDER`, `--offline` | As for the checker |
 

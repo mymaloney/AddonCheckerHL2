@@ -15,6 +15,8 @@
 - New files are listed with what's in them; the same change in many places is listed once.
 - Random sound lists (`rndwave`) and entity outputs keep every addon's entries when combined.
 - `exec "a.cfg"` and `exec a.cfg` count as the same command.
+- Lists scripts that use sounds, models or materials the original game doesn't have;
+  `--original-files-only` leaves those addons out of `combined/`.
 
 ## 1.0.0 (2026-10-12)
 
