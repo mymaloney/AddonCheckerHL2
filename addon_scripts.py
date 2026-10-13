@@ -190,7 +190,7 @@ def decode(data):
 # KeyValues (scripts/*.txt, resource/*.res...) and .cfg files
 # ---------------------------------------------------------------------------
 
-KV_TOKEN = re.compile(r'//[^\n]*|"([^"\n]*)"?|(\[[^\]\n]*\])|([{}])|([^\s{}"]+)')
+KV_TOKEN = re.compile(r'//[^\n]*|"([^"]*)"?|(\[[^\]\n]*\])|([{}])|([^\s{}"]+)')  # strings can span lines
 BLOCK = object()  # value of a key that holds more keys
 
 
@@ -394,10 +394,11 @@ def entity_name(pairs):
     for k, v, _ in pairs:
         keys.setdefault(k.lower(), v)
     name = keys.get("classname", "entity")
-    if keys.get("hammerid"):
-        return "%s #%s" % (name, keys["hammerid"])
+    # By name first: a patch can add Hammer ids the original map's copy of an entity doesn't have.
     if keys.get("targetname"):
         return '%s "%s"' % (name, keys["targetname"])
+    if keys.get("hammerid"):
+        return "%s #%s" % (name, keys["hammerid"])
     if keys.get("origin"):
         return "%s at (%s)" % (name, keys["origin"])
     return name
@@ -590,6 +591,8 @@ def merge_settings(base, versions, removals=True):
             if what == "removed":
                 claim(path, addon, None)
                 for p in [p for p in merged if p[:len(path)] == path]:
+                    if p != path and owner.get(p, (addon,))[0] is not addon:
+                        claim(p, addon, None)  # another addon changed something in what this one removes
                     del merged[p]
                 continue
             # An added block brings everything under it.

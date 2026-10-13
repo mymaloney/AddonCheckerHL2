@@ -97,6 +97,10 @@ class KeyValues(unittest.TestCase):
         self.assertEqual(flat[(("s", 1), ("x [$win32]", 1))][2], "1")
         self.assertEqual(flat[(("s", 1), ("x [$x360]", 1))][2], "2")
 
+    def test_strings_can_span_lines(self):
+        self.assertEqual(sc.parse_kv('"A" { "text" "line one\nline two" "b" "1" }'),
+                         [["A", [["text", "line one\nline two", ""], ["b", "1", ""]], ""]])
+
     def test_free_text_and_broken_files_arent_keyvalues(self):
         self.assertIsNone(sc.parse_kv("Thanks to everyone who helped make this mod"))
         self.assertIsNone(sc.parse_kv('"A" { "b" "c"'))
@@ -201,7 +205,7 @@ class Entities(unittest.TestCase):
     def test_entity_patch(self):
         parsed = sc.Parsed("maps/m_l_0.lmp", lmp_bytes(ENTITIES))
         self.assertEqual(parsed.kind, "ents")
-        self.assertEqual(parsed.flat[(("logic_relay #42", 1), ("targetname", 1))][2], "start_relay")
+        self.assertEqual(parsed.flat[(("logic_relay \"start_relay\"", 1), ("targetname", 1))][2], "start_relay")
         self.assertEqual(sc.parse_entities(sc.bsp_entities(bsp_bytes(ENTITIES)).decode()),
                          sc.parse_entities(ENTITIES))
 
@@ -211,7 +215,7 @@ class Entities(unittest.TestCase):
         self.assertEqual(sorted(sc.describe(sc.diff_settings(old, new), "ents", sc.entity_names(
             sc.Parsed("maps/a_l_0.lmp", lmp_bytes(ENTITIES)), sc.Parsed("maps/a_l_0.lmp", lmp_bytes(
                 ENTITIES.replace('"logic_relay"', '"logic_branch"')))))),
-            ['+ entity logic_branch #42 "start_relay"', '- entity logic_relay #42 "start_relay"'])
+            ['+ entity logic_branch "start_relay"', '- entity logic_relay "start_relay"'])
 
     def test_round_trip(self):
         flat = sc.flatten_entities(sc.parse_entities(ENTITIES))
@@ -301,9 +305,9 @@ class EndToEnd(Base):
         self.assertIn("(in the game, only workshop/555's copy is used)", report)
         # Map entity patches, compared with the original map's entities
         self.assertIn('maps/town_l_0.lmp  (2 changes)\n'
-                      '       + logic_relay #42/ontrigger = "alyx,SpeakResponseConcept,TLK_B,0,-1"\n'
-                      '       - logic_relay #42/ontrigger (was "alyx,SpeakResponseConcept,TLK_A,0,-1")', report)
-        self.assertIn('logic_relay #42/targetname: "start_relay" -> "go_relay"', report)
+                      '       + logic_relay "start_relay"/ontrigger = "alyx,SpeakResponseConcept,TLK_B,0,-1"\n'
+                      '       - logic_relay "start_relay"/ontrigger (was "alyx,SpeakResponseConcept,TLK_A,0,-1")', report)
+        self.assertIn('+ entity logic_relay "go_relay"', report)  # renamed: a different entity now
         self.assertIn("Also changes (not copied): 1 materials, 1 models", report)
         self.assertNotIn('"99"', report)  # 333 is turned off
         # Load order: custom/ first, then workshop.txt top to bottom; the later one wins.
@@ -324,10 +328,11 @@ class EndToEnd(Base):
         self.assertEqual(self.read("combined", "scripts", "credits.txt"), "Made by someone")
         with open(self.path("out", "combined", "maps", "town_l_0.lmp"), "rb") as f:
             town = sc.Parsed("maps/town_l_0.lmp", f.read())
-        relay = {k[1][0]: v[2] for k, v in town.flat.items() if k[0][0] == "logic_relay #42" and len(k) == 2}
-        self.assertEqual(relay["targetname"], "go_relay")  # 555's change
-        self.assertIn("alyx,SpeakResponseConcept,TLK_B,0,-1", relay.values())  # and 444's
-        self.assertNotIn("alyx,SpeakResponseConcept,TLK_A,0,-1", relay.values())
+        ents = {k[0][0] for k in town.flat}
+        self.assertIn('logic_relay "go_relay"', ents)  # 555 renamed the relay: a new entity...
+        self.assertNotIn('logic_relay "start_relay"', ents)  # ...and the old one is gone, 444's change with it
+        self.assertIn('logic_relay "start_relay"/ontrigger: workshop/444 sets "alyx,SpeakResponseConcept,TLK_B,0,-1", '
+                      'workshop/555 sets (removed) -> workshop/555 wins', report)
         self.assertEqual(town.lump[4], 7)  # map revision kept
         self.assertFalse(os.path.exists(self.path("out", "combined", "materials")))
         self.assertTrue(any(n.endswith("workshop_111") or "111" in n for n in os.listdir(self.path("out", "addons"))))
