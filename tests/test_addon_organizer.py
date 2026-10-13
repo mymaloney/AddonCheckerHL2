@@ -993,6 +993,26 @@ class OrganizerTest(unittest.TestCase):
         self.install(archive)
         self.assertIn("install 7-Zip", [d[2] for d in self.dialogs if d[1] == "Install addon"][0])
 
+    def test_extract_scripts(self):
+        for wsid, clip in (("111", "25"), ("222", "30"), ("444", "99")):
+            write(os.path.join(self.workshop, wsid, "scripts", "weapon_pistol.txt"),
+                  'WeaponData { "clip_size" "%s" "damage" "%s" }' % (clip, wsid))
+        app = self.open()
+        out = os.path.join(self.tmp, "scripts out")
+        self.patch(ao.filedialog, "askdirectory", lambda **kw: out)
+        self.patch(ao, "open_path", lambda path: self.dialogs.append(("open", path, "")))
+        app.extract_scripts()
+        end = time.time() + 30
+        while not any(d[0] == "open" for d in self.dialogs) and time.time() < end:
+            self.root.update()
+            time.sleep(0.01)
+        self.assertEqual(self.errors, [])
+        self.assertIn(("open", out, ""), self.dialogs)
+        with open(os.path.join(out, "combined", "scripts", "weapon_pistol.txt"), encoding="utf-8") as f:
+            text = f.read()
+        self.assertIn('"clip_size"\t\t"30"', text)  # 222 loads after 111 and wins; 444 is off
+        self.assertNotIn("99", text)
+
 
 if __name__ == "__main__":
     unittest.main()

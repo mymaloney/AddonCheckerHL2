@@ -3,6 +3,23 @@
 > ⚠️ This project was **vibe-coded**: written largely by an AI model, directed and tested by a person.
 > Read the warnings at the top of the [README](README.md) before using it.
 
+## Unreleased
+
+### Scripts and settings (`addon_scripts.py`, new)
+- Copies the scripts and settings (text files) out of every loaded addon, shows what each one
+  changes compared with the original game, setting by setting, and combines them all into one folder
+  (`combined/`), the later-loading addon winning where two set the same thing. For mod makers.
+- Organizer: Tools > Extract scripts and settings....
+- Map entity patches (`.lmp`) are compared with the original map's entities and combined entity by
+  entity.
+- New files are listed with what's in them; the same change in many places is listed once.
+- Random sound lists (`rndwave`) and entity outputs keep every addon's entries when combined.
+- `exec "a.cfg"` and `exec a.cfg` count as the same command.
+- Lists scripts that use sounds, models or materials the original game doesn't have;
+  `--original-files-only` leaves those addons out of `combined/`.
+- The report lists the original game's VPKs and loose folders it read, and VPKs `gameinfo.txt`
+  names that aren't there; loose game files count as the original game's.
+
 ## 1.0.0 (2026-10-12)
 
 First public release. Public domain ([The Unlicense](LICENSE)).

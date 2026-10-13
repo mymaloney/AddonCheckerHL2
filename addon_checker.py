@@ -228,9 +228,9 @@ def detect_vpk(path):
     return None
 
 
-def parse_vpk(stream, files, magic_read=False):
-    """Reads a VPK's directory tree (v1 or v2) into files. Only the tree is read, not the data.
-    Returns how many entries the tree lists."""
+def read_vpk_tree(stream, magic_read=False):
+    """Reads a VPK's header and directory tree (v1 or v2). Returns (tree, position of the data
+    that follows the tree, which is where files stored in the directory file itself start)."""
     if not magic_read and read_exact(stream, 4) != VPK_MAGIC:
         raise BadAddon("not a VPK file")
     version, tree_size = struct.unpack("<II", read_exact(stream, 8))
@@ -240,9 +240,12 @@ def parse_vpk(stream, files, magic_read=False):
         read_exact(stream, 16)  # section sizes we don't need
     elif version != 1:
         raise BadAddon("unsupported VPK version %d" % version)
-    tree = read_exact(stream, tree_size)
+    return read_exact(stream, tree_size), (12 if version == 1 else 28) + tree_size
 
-    pos = count = 0
+
+def vpk_entries(tree):
+    """(path, crc32, preload bytes, archive index, offset, length) of each file in a VPK tree."""
+    pos = 0
 
     def string():
         nonlocal pos
@@ -257,7 +260,7 @@ def parse_vpk(stream, files, magic_read=False):
     while True:
         ext = string()
         if not ext:
-            return count
+            return
         while True:
             directory = string()
             if not directory:
@@ -268,13 +271,95 @@ def parse_vpk(stream, files, magic_read=False):
                     break
                 if pos + 18 > len(tree):
                     raise BadAddon("corrupt VPK directory")
-                crc, preload, _archive, _offset, length, _end = struct.unpack_from("<IHHIIH", tree, pos)
+                crc, preload, archive, offset, length, _end = struct.unpack_from("<IHHIIH", tree, pos)
+                preload_data = tree[pos + 18:pos + 18 + preload]
                 pos += 18 + preload
                 path = name if directory == " " else directory + "/" + name
                 if ext != " ":
                     path += "." + ext
-                files.setdefault(norm(path), (preload + length, crc))
-                count += 1
+                yield norm(path), crc, preload_data, archive, offset, length
+
+
+def parse_vpk(stream, files, magic_read=False):
+    """Reads a VPK's directory tree (v1 or v2) into files. Only the tree is read, not the data.
+    Returns how many entries the tree lists."""
+    tree, _ = read_vpk_tree(stream, magic_read)
+    count = 0
+    for path, crc, preload, _archive, _offset, length in vpk_entries(tree):
+        files.setdefault(path, (len(preload) + length, crc))
+        count += 1
+    return count
+
+
+VPK_INLINE = 0x7FFF  # archive index of files stored in the directory file itself
+
+
+def skip_ahead(stream, n):
+    if n < 0:
+        raise BadAddon("corrupt VPK directory")
+    try:
+        stream.seek(n, 1)
+        return
+    except (AttributeError, OSError, ValueError):
+        pass  # streams that can only be read
+    while n:
+        data = stream.read(min(n, 1024 * 1024))
+        if not data:
+            raise BadAddon("file is truncated")
+        n -= len(data)
+
+
+def vpk_stream_contents(stream, want, magic_read=False):
+    """The files want(path) accepts from an open VPK, read front to back so compressed VPKs
+    work too. Returns ({path: bytes}, [entries stored in separate _000.vpk parts])."""
+    tree, start = read_vpk_tree(stream, magic_read)
+    out, inline, parts, seen = {}, [], [], set()
+    for e in vpk_entries(tree):
+        if e[0] in seen or not want(e[0]):
+            continue
+        seen.add(e[0])
+        (inline if e[3] == VPK_INLINE else parts).append(e)
+    pos = start
+    for path, _crc, preload, _archive, offset, length in sorted(inline, key=lambda e: e[4]):
+        body = b""
+        if length:
+            skip_ahead(stream, start + offset - pos)
+            body = read_exact(stream, length)
+            pos = start + offset + length
+        out[path] = preload + body
+    return out, parts
+
+
+def read_vpk_contents(path, want):
+    """Contents of the files want(path) accepts in a (compressed) VPK or a zip of VPKs:
+    {path: bytes}. None if the file is neither."""
+    opener = detect_vpk(path)
+    if opener:
+        s = opener(path)
+        try:
+            out, parts = vpk_stream_contents(s, want)
+        finally:
+            s.close()
+        if parts and not path.lower().endswith("_dir.vpk"):
+            raise BadAddon("files are stored in data files (_000.vpk) that a single VPK can't have")
+        for name, _crc, preload, archive, offset, length in parts:
+            with open("%s_%03d.vpk" % (path[:-8], archive), "rb") as f:
+                f.seek(offset)
+                out[name] = preload + read_exact(f, length)
+        return out
+
+    if zipfile.is_zipfile(path):
+        out = {}
+        with zipfile.ZipFile(path) as z:
+            for member in z.namelist():
+                if not member.lower().endswith(".vpk") or VPK_ARCHIVE_PART.search(member):
+                    continue
+                with z.open(member) as s:
+                    if s.read(4) == VPK_MAGIC:
+                        for name, data in vpk_stream_contents(s, want, magic_read=True)[0].items():
+                            out.setdefault(name, data)
+        return out
+    return None
 
 
 def read_packed_file(addon, path):
@@ -661,6 +746,22 @@ FALLBACK_GAME_FOLDERS = ["hl2_complete", "ep2", "episodic", "hl2", "lostcoast", 
 GAMEINFO_FOLDERS = ("hl2_complete", "hl2")
 
 
+def search_paths_block(text):
+    """The lines inside gameinfo.txt's SearchPaths { }, without comments, or None. Braces are
+    counted, so a nested block or a stray brace doesn't end it early."""
+    text = "\n".join(line.split("//")[0] for line in text.splitlines())
+    m = re.search(r'"?SearchPaths"?\s*\{', text, re.IGNORECASE)
+    if not m:
+        return None
+    depth, end = 1, m.end()
+    while end < len(text):
+        depth += {"{": 1, "}": -1}.get(text[end], 0)
+        if depth == 0:
+            break
+        end += 1
+    return [line for line in re.split(r"[{}\n]", text[m.end():end]) if line.strip()]
+
+
 def gameinfo_search_paths(game_dir, folders=GAMEINFO_FOLDERS):
     """SearchPaths of the first readable gameinfo.txt in folders, highest priority first:
     ([(keys, path)], gameinfo.txt path or None). Paths are resolved to full paths; a trailing
@@ -672,12 +773,11 @@ def gameinfo_search_paths(game_dir, folders=GAMEINFO_FOLDERS):
                 text = f.read()
         except OSError:
             continue
-        m = re.search(r'"?SearchPaths"?\s*\{(.*?)\}', text, re.IGNORECASE | re.DOTALL)
-        if not m:
+        block = search_paths_block(text)
+        if block is None:
             continue
         paths = []
-        for line in m.group(1).splitlines():
-            line = line.split("//")[0]
+        for line in block:
             parts = re.findall(r'"([^"]*)"|(\S+)', line)
             parts = [a or b for a, b in parts]
             if len(parts) < 2:
@@ -986,6 +1086,32 @@ def rank_custom_addons(addons, last_wins=True):
     for n, a in enumerate(custom):
         a.rank = len(custom) - n if last_wins else n - len(custom)
     return custom
+
+
+def apply_load_order(addons, entries, include_all=False):
+    """Ranks Workshop addons by workshop.txt (entries: [(id, enabled)], in load order).
+    Returns (addons to check, disabled, unlisted). The addons to check are the ones the game
+    loads, or with include_all also the disabled and unlisted ones."""
+    info = {wsid: (n, enabled) for n, (wsid, enabled) in enumerate(entries)}
+    active, disabled, unlisted = [], [], []
+    for a in addons:
+        if not a.workshop_id:
+            active.append(a)  # custom/ addons: always loaded, ahead of the Workshop ones
+            continue
+        if a.workshop_id not in info:
+            unlisted.append(a)
+            if include_all:
+                active.append(a)
+            continue
+        n, enabled = info[a.workshop_id]
+        a.position = n + 1
+        if not enabled:
+            disabled.append(a)
+            if not include_all:
+                continue
+        a.rank = -n  # later in workshop.txt loads later and wins
+        active.append(a)
+    return active, disabled, unlisted
 
 
 def known(*addons):
@@ -1661,25 +1787,7 @@ def main():
         print("No Workshop items found in the scanned folders, so --load-order isn't used. "
               "Pass the workshop/content/220 folder itself.", file=sys.stderr)
     if load_order:
-        info = {wsid: (n, enabled) for n, (wsid, enabled) in enumerate(entries)}
-        active = []
-        for a in addons:
-            if not a.workshop_id:
-                active.append(a)  # custom/ addons: always loaded, ahead of the Workshop ones
-                continue
-            if a.workshop_id not in info:
-                unlisted.append(a)
-                if args.all:
-                    active.append(a)
-                continue
-            n, enabled = info[a.workshop_id]
-            a.position = n + 1
-            if not enabled:
-                disabled.append(a)
-                if not args.all:
-                    continue
-            a.rank = -n  # later in workshop.txt loads later and wins
-            active.append(a)
+        active, disabled, unlisted = apply_load_order(addons, entries, args.all)
         if args.all:
             loaded = [a for a in active if a not in disabled and a not in unlisted]
         else:

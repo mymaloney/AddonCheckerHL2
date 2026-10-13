@@ -34,8 +34,9 @@ addons (`steamapps/workshop/content/220`) and your `custom/` folders, and report
 
 ## Download
 
-Get the zip from the [Releases page](../../releases): it has `addon_organizer.exe` (the window) and
-`addon_checker.exe` (the report) for Windows, plus the `.py` files. Unpack it anywhere and run one.
+Get the zip from the [Releases page](../../releases): it has `addon_organizer.exe` (the window),
+`addon_checker.exe` (the report) and `addon_scripts.exe` (scripts and settings, for mod makers) for
+Windows, plus the `.py` files. Unpack it anywhere and run one.
 Windows SmartScreen may warn that the program is unrecognized: it isn't signed. If you'd rather not
 run an unsigned `.exe` (reasonable, given the warning above), run the `.py` files with Python instead.
 
@@ -175,7 +176,7 @@ Workshop titles in `addon_titles.json` (so they show offline too).
 
 - **Workshop items:** each item folder (named by its id) is one addon. Anything else in the Workshop folder, like an Explorer copy `1234 - Copy` or a VPK put there by hand, is listed as *not Workshop items*: the game never loads it. The VPKs inside an item are read whether they're plain or compressed. Supported compression: LZMA (standard and Valve's `LZMA` header), xz, gzip, bzip2, zlib, and zip files containing VPKs. Loose files in an item folder are read too.
 - **`custom/` addons:** sub-folders (loose files, plus a `pak01_dir.vpk` inside), single `foo.vpk` files, and multi-part `foo_dir.vpk` + `foo_000.vpk`…
-- VPK contents are never extracted. The tool compares the CRC32 values each VPK stores for its files, so even gigabytes of addons scan quickly.
+- VPK contents are never extracted (only `addon_scripts.py` reads text files out of them). The tool compares the CRC32 values each VPK stores for its files, so even gigabytes of addons scan quickly.
 - Files at an addon's root (`addoninfo.txt`, preview images…) are ignored, since they aren't game content.
 
 If a Workshop item uses a format the tool doesn't recognize, the report lists it under
@@ -211,6 +212,65 @@ The game keeps your Workshop addons' load order in
   folder, in `gameinfo.txt`'s order). So any Workshop addon beats a `custom/` addon, and among `custom/`
   addons Z beats A. Addons in `custom_disabled/` (the organizer's "off") aren't loaded or checked.
 
+## Scripts and settings (for mod makers)
+
+> ⚠️ **Vibe-coded, like the rest.** The combined folder is a starting point to read and edit by hand,
+> not a finished mod. Check every file before you ship anything built from it, and ask addon authors
+> before you publish their work (or credit them).
+
+`addon_scripts.py` shows what every addon you have loaded changes in the game's scripts and
+settings, and combines all of those changes into one folder:
+
+```sh
+python addon_scripts.py                  # results go to addon_scripts/
+```
+
+It only copies text files: `scripts/` (weapons, sounds, soundscapes, `propdata`,
+`surfaceproperties`...), `cfg/`, `resource/` (HUD and menus), other `.txt`/`.cfg`/`.res` files, and
+map entity patches (`maps/<map>_l_0.lmp`, which change a map's entities without replacing the map).
+Models, materials, sounds and whole maps are counted per addon, not copied.
+
+- **`report.txt`**: every addon in load order, and what each file changes compared with the
+  original game, setting by setting (`weapondata/clip_size: "18" -> "25"`). Files the original game
+  doesn't have are listed as new, with what's in them; ones identical to it are marked as such. Text
+  files that aren't settings files get a line-by-line diff. The same change made in many places (one
+  setting changed in 500 sounds) is listed once, with how many places and a few of them.
+- It also lists the addons whose scripts add references to sounds, models or materials the original
+  game doesn't have, and for each file whether the addon brings it, another addon does, or nobody
+  does (missing). References the original script already had don't count: Valve's own scripts name
+  a few sounds that were never shipped. A combined folder that keeps those scripts only works with those files too;
+  `--original-files-only` leaves those addons out of it.
+- Entity patches are compared with the original map's entities, entity by entity (by Hammer id,
+  or name or position).
+- **`addons/`**: each addon's files as they are, one folder per addon, numbered in load order.
+- **`combined/`**: every changed file, ready to copy into a mod. In the game, an addon's copy of a
+  file replaces the whole file; here, settings files (KeyValues like `scripts/*.txt`, and `.cfg`
+  files) changed by several addons are combined setting by setting. Where two addons set the same
+  thing, the one that loads later wins, and `report.txt` lists each of those conflicts. In lists the
+  game picks from at random (`rndwave`) and entity outputs (`OnTrigger`...), entries from every addon
+  are kept. Other files changed by several addons are taken whole from the addon that loads later.
+  Combined files lose their comments; files only one addon changes are copied as they are.
+- The combined folder is *not* what the game does: there, only the later-loading addon's copy of a
+  file is used, and `report.txt` says whose for each combined file. It also can't fix your own game:
+  `custom/` addons load before every Workshop addon, so a combined file there loses to the Workshop
+  copies. It's for building a mod from.
+- A `.cfg` that leaves out a command doesn't count as removing it, so a small `skill.cfg` doesn't
+  wipe the original's settings from the combined one.
+- Only the addons the game loads are included (`--all` adds disabled ones). The organizer's
+  **Tools > Extract scripts and settings...** does the same with the load order on screen.
+
+| Option | |
+|---|---|
+| `python addon_scripts.py FOLDER ...` | Use these addon folders instead |
+| `--out FOLDER` | Where the results go (default `addon_scripts`). It must be empty or hold earlier results, which are replaced. |
+| `--materials` | Also copy material settings (`.vmt`) |
+| `--original-files-only` | Leave addons whose scripts use sounds, models or materials the original game doesn't have out of `combined/` |
+| `--all` | Also include disabled addons |
+| `--game-dir FOLDER`, `--offline` | As for the checker |
+
+Not handled: entities inside replaced maps (`.bsp`), and binary files like particles (`.pcf`) or
+compiled captions (`.dat`).
+
 ## Tests
 
 > ⚠️ Passing tests don't make vibe-coded software safe: the tests were written by the same AI, from the
@@ -218,6 +278,7 @@ The game keeps your Workshop addons' load order in
 
 ```sh
 python -m unittest tests.test_addon_checker -v
+python -m unittest tests.test_addon_scripts -v
 python -m unittest tests.test_addon_organizer -v    # opens windows; on Linux without a desktop: xvfb-run -a ...
 ```
 

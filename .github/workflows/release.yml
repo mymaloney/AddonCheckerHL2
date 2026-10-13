@@ -22,6 +22,7 @@ jobs:
         run: |
           pyinstaller --onefile --name addon_checker addon_checker.py
           pyinstaller --onefile --windowed --name addon_organizer addon_organizer.py
+          pyinstaller --onefile --name addon_scripts addon_scripts.py
       - name: Smoke test
         shell: pwsh
         run: |
@@ -29,12 +30,14 @@ jobs:
           Write-Output $v
           if ($LASTEXITCODE -ne 0 -or $v -notmatch "HL2 Addon Checker") { exit 1 }
           if (-not (Test-Path dist\addon_organizer.exe)) { exit 1 }
+          $v = & dist\addon_scripts.exe --version
+          if ($LASTEXITCODE -ne 0 -or $v -notmatch "HL2 Addon Scripts") { exit 1 }
       - name: Package
         shell: pwsh
         run: |
           $name = "HL2-Addon-Checker-" + ($env:GITHUB_REF_NAME -replace '[^A-Za-z0-9._-]', '-') + "-windows"
           New-Item -ItemType Directory $name | Out-Null
-          Copy-Item dist\addon_checker.exe, dist\addon_organizer.exe, README.md, LICENSE, CHANGELOG.md, addon_checker.py, addon_organizer.py $name
+          Copy-Item dist\addon_checker.exe, dist\addon_organizer.exe, dist\addon_scripts.exe, README.md, LICENSE, CHANGELOG.md, addon_checker.py, addon_organizer.py, addon_scripts.py $name
           Compress-Archive -Path $name -DestinationPath "$name.zip"
           "ZIP=$name.zip" | Out-File -FilePath $env:GITHUB_ENV -Append
       - uses: actions/upload-artifact@v4
@@ -49,6 +52,6 @@ jobs:
           body: |
             ⚠️ **This project was vibe-coded:** written largely by an AI model, directed and tested by a person. There is **no warranty**. Back up your addons and `hl2_complete/cfg/workshop.txt` before using it, and read the warnings in the README.
 
-            Download the zip below, unpack it anywhere, and run `addon_organizer.exe` (the window) or `addon_checker.exe` (the report). Windows SmartScreen may warn about an unsigned program; the `.py` files in the zip are the same tools if you'd rather run them with Python.
+            Download the zip below, unpack it anywhere, and run `addon_organizer.exe` (the window), `addon_checker.exe` (the report) or `addon_scripts.exe` (scripts and settings, for mod makers). Windows SmartScreen may warn about an unsigned program; the `.py` files in the zip are the same tools if you'd rather run them with Python.
 
             See CHANGELOG.md for what's in this version.

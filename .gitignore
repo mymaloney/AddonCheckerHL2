@@ -50,3 +50,4 @@ addon_rules.json.broken*
 build/
 dist/
 *.spec
+addon_scripts/

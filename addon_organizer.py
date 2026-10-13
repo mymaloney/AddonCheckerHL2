@@ -33,6 +33,7 @@ from tkinter import font as tkfont
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import addon_checker as ac  # noqa: E402
+import addon_scripts  # noqa: E402
 
 SETTINGS_FILE = os.path.join(ac.app_dir(), "addon_rules.json")  # next to the .py or the .exe
 KEEP_BACKUPS = 10  # workshop.txt backups kept; older ones are removed when saving
@@ -833,6 +834,7 @@ class Organizer:
         t = menu("Tools")
         t.add_command(label="Sort by rules", command=self.sort_by_rules)
         t.add_command(label="Move addons that do nothing to the losing end", command=self.move_removable)
+        t.add_command(label="Extract scripts and settings...", command=self.extract_scripts)
         t.add_separator()
         t.add_command(label="Problems...", command=self.show_problems)
 
@@ -2402,6 +2404,45 @@ class Organizer:
             messagebox.showerror("Export report", str(e))
             return
         self.status.config(text="Report saved to %s" % path)
+
+    def extract_scripts(self):
+        """Every loaded addon's scripts and settings, what they change, and all of them combined
+        (addon_scripts.py), in a folder the user picks."""
+        if not self.addons or self.scanning:
+            return
+        folder = filedialog.askdirectory(parent=self.root, title="Choose an empty folder for the scripts and settings")
+        if not folder:
+            return
+        # The load order on screen, saved or not: the addons that would load, ranked.
+        active = [a for a in self.addons if a.rank is not None or (not a.workshop_id and not a.custom_off)]
+        game = self.found_game
+        self.status.config(text="Extracting scripts and settings...")
+
+        def work():
+            def progress(i, total, name=""):
+                self.set_status("Extracting scripts and settings %d of %d: %s" % (i, total, name))
+            try:
+                result = addon_scripts.extract(active, game, folder, progress=progress)
+            except Exception as e:
+                message = str(e) or type(e).__name__
+                self.set_status("Extracting failed: " + message)
+                self.ui(lambda: messagebox.showerror("Extract scripts and settings", message))
+                return
+            self.ui(lambda: self.extract_done(result, folder))
+        threading.Thread(target=work, daemon=True).start()
+
+    def extract_done(self, result, folder):
+        self.status.config(text="Scripts and settings saved to %s" % folder)
+        text = ("%s copied from %s.\n%s change the original game; %s changed by more than one addon "
+                "(%s, the addon that loads later wins).\n\nreport.txt lists every change. combined/ holds "
+                "all of them in one folder." % (
+                    ac.plural(result["files"], "file"), ac.plural(result["addons"], "addon"),
+                    ac.plural(result["changed"], "file"), ac.plural(result["shared"], "file"),
+                    ac.plural(result["conflicts"], "conflict")))
+        if result["problems"]:
+            text += "\n\nSome files couldn't be read; report.txt lists them."
+        if messagebox.askyesno("Extract scripts and settings", text + "\n\nOpen the folder?"):
+            open_path(folder)
 
     def on_close(self):
         self.save_note()
