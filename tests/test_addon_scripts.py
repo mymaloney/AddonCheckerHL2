@@ -124,6 +124,12 @@ class KeyValues(unittest.TestCase):
         self.assertEqual(lines, ['channel: "CHAN_VOICE" -> "CHAN_STATIC"  in 6 places: snd.0, snd.1, snd.2, ...',
                                  'snd.6/channel: "CHAN_VOICE" -> "CHAN_ITEM"'])
 
+    def test_repeats_in_one_place_are_counted_once(self):
+        old = parse('"A" { "x" "1" } "B" { "x" "1" }')
+        new = parse('"A" { "p" { "w" "1" } "p" { "w" "2" } "p" { "w" "3" } } "B" { "p" { "w" "4" } "p" { "w" "5" } }')
+        self.assertEqual(sc.describe(sc.diff_settings(old, new, False), "kv"),
+                         ["+ p = {...}  5 times in 2 places: a, b"])
+
     def test_diff(self):
         new = parse(PISTOL.replace('"18"', '"25"').replace('\t"damage"\t"8"\n', "")
                     .replace("SoundData", 'Extra { "a" "1" }\n\tSoundData'))
@@ -185,6 +191,14 @@ class Entities(unittest.TestCase):
         self.assertEqual(parsed.flat[(("logic_relay #42", 1), ("targetname", 1))][2], "start_relay")
         self.assertEqual(sc.parse_entities(sc.bsp_entities(bsp_bytes(ENTITIES)).decode()),
                          sc.parse_entities(ENTITIES))
+
+    def test_added_and_removed_entities_are_named(self):
+        old = sc.flatten_entities(sc.parse_entities(ENTITIES))
+        new = sc.flatten_entities(sc.parse_entities(ENTITIES.replace('"logic_relay"', '"logic_branch"')))
+        self.assertEqual(sorted(sc.describe(sc.diff_settings(old, new), "ents", sc.entity_names(
+            sc.Parsed("maps/a_l_0.lmp", lmp_bytes(ENTITIES)), sc.Parsed("maps/a_l_0.lmp", lmp_bytes(
+                ENTITIES.replace('"logic_relay"', '"logic_branch"')))))),
+            ['+ entity logic_branch #42 "start_relay"', '- entity logic_relay #42 "start_relay"'])
 
     def test_round_trip(self):
         flat = sc.flatten_entities(sc.parse_entities(ENTITIES))

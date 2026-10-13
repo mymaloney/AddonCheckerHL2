@@ -394,7 +394,9 @@ def flatten_entities(entities):
         name = entity_name(pairs)
         seen[name] += 1
         path = ((name, seen[name]),)
-        out[path] = (name, "", BLOCK)
+        target = next((v for k, v, _ in pairs if k.lower() == "targetname"), "")
+        shown = name + (' "%s"' % target if target and target not in name else "")
+        out[path] = (shown, "", BLOCK)  # what the report calls it
         keys = Counter()
         for key, value, _ in pairs:
             step = key.lower() + ("=" + value.lower() if key.lower().startswith("on") else "")
@@ -475,9 +477,10 @@ def describe_one(what, name, old, new, kind):
     return "- %s (was %s)" % (name, show_value(old))
 
 
-def describe(changes, kind):
+def describe(changes, kind, names=None):
     """Report lines for changes. The same change to the same setting in many places (a sound
-    property changed in 500 sounds) is one line, with a few of the places."""
+    property changed in 500 sounds) is one line, with a few of the places. names: path -> how
+    to call a whole entity that's added or removed."""
     def group(what, path, old, new):
         return (what, path[-1][0].partition("=")[0], old, new) if len(path) > 1 and kind != "cfg" else None
     places = OrderedDict()
@@ -491,11 +494,22 @@ def describe(changes, kind):
         if g and len(places[g]) >= GROUP_MIN:
             if g not in done:
                 done.add(g)
-                lines.append("%s  in %d places: %s, ..." % (
-                    describe_one(what, g[1], old, new, kind), len(places[g]), ", ".join(places[g][:3])))
+                where = list(OrderedDict.fromkeys(places[g]))
+                count = ("in %d places" % len(where) if len(where) == len(places[g])
+                         else "%d times in %d places" % (len(places[g]), len(where)))
+                lines.append("%s  %s: %s%s" % (describe_one(what, g[1], old, new, kind), count,
+                                               ", ".join(where[:3]), ", ..." if len(where) > 3 else ""))
+            continue
+        if kind == "ents" and len(path) == 1 and BLOCK in (old, new):
+            name = (names or {}).get(path, show_path(path))
+            lines.append(("+ entity %s" if what == "added" else "- entity %s") % name)
             continue
         lines.append(describe_one(what, show_path(path) if kind != "cfg" else path[0][0], old, new, kind))
     return lines
+
+
+def entity_names(*parsed):
+    return {p: e[0] for x in parsed if x is not None and x.kind == "ents" for p, e in x.flat.items() if len(p) == 1}
 
 
 def listing(parsed):
@@ -504,7 +518,7 @@ def listing(parsed):
         lines = ["+ " + line for line in parsed.text.splitlines() if line.strip()]
         return lines[:MAX_DIFF_LINES] + (["... (see the file itself)"] if len(lines) > MAX_DIFF_LINES else [])
     return describe([("added", p, None, v) for p, (_, _, v) in parsed.flat.items()
-                     if v is not BLOCK or parsed.kind == "cfg"], parsed.kind)
+                     if v is not BLOCK or parsed.kind == "cfg"], parsed.kind, entity_names(parsed))
 
 
 def text_diff(old, new, path):
@@ -670,7 +684,7 @@ def extract(addons, game_dir, out_dir, materials=False, progress=None):
                     report.append("   %s  (same settings as the original game, written differently)" % path)
                     continue
                 report.append("   %s  (%s)" % (path, ac.plural(len(changes), "change")))
-                lines = describe(changes, mine.kind)
+                lines = describe(changes, mine.kind, entity_names(orig, mine))
             elif mine.text is None:
                 report.append("   %s  (changed, can't be read as text)" % path)
                 continue
