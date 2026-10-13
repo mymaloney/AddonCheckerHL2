@@ -44,7 +44,10 @@ GROUP_MIN = 5  # the same change in this many places is listed once
 # is part of what they set (bind KEY, alias NAME).
 KEYED_COMMANDS = {"bind", "unbind", "alias", "bind_osx", "setinfo"}
 # Commands that do something rather than set something: every line counts on its own.
-ACTION_COMMANDS = {"exec", "echo", "play", "playgamesound", "say", "wait", "toggle", "incrementvar"}
+ACTION_COMMANDS = {"exec", "echo", "play", "playgamesound", "say", "wait", "toggle", "incrementvar", "ent_fire",
+                   "ent_create", "ent_remove", "ent_remove_all", "ent_teleport", "ent_setname", "give", "impulse",
+                   "kill", "explode", "firetarget", "map", "changelevel", "script", "script_execute", "playvideo",
+                   "snd_restart", "mat_reloadallmaterials", "r_cleardecals", "host_writeconfig"}
 
 
 def wanted(path, materials=False):
@@ -271,28 +274,28 @@ def format_kv(pairs, depth=0):
 
 
 def parse_cfg(text):
-    """A .cfg file as an OrderedDict of setting -> (command as written, "", arguments)."""
+    """A .cfg file as an OrderedDict of setting -> (command as written, "", arguments).
+    A cfg that waits (a timed script) is a sequence: every line is a step of its own."""
     out = OrderedDict()
     seen = Counter()
-    for line in text.splitlines():
-        for part in split_commands(line):
-            words = part.split(None, 2)
-            if not words:
-                continue
-            cmd = words[0].lower()
-            if cmd in KEYED_COMMANDS and len(words) > 1:
-                name = cmd + " " + words[1].strip('"').lower()
-                shown, args = words[0] + " " + words[1], words[2] if len(words) > 2 else ""
-            elif cmd in ACTION_COMMANDS:
-                name, shown, args = " ".join(part.replace('"', "").lower().split()), part, ""
-            else:
-                name, shown, args = cmd, words[0], part.split(None, 1)[1] if len(words) > 1 else ""
-            seen[name] += 1
-            if cmd in ACTION_COMMANDS:
-                out[((name, seen[name]),)] = (shown, "", args)
-            else:
-                out[((name, 1),)] = (shown, "", args)  # set twice: the last one counts
-                out.move_to_end(((name, 1),))
+    lines = [part for line in text.splitlines() for part in split_commands(line)]
+    timed = any(part.split(None, 1)[0].lower() == "wait" for part in lines)
+    for part in lines:
+        words = part.split(None, 2)
+        cmd = words[0].lower()
+        if cmd in KEYED_COMMANDS and len(words) > 1:
+            name = cmd + " " + words[1].strip('"').lower()
+            shown, args = words[0] + " " + words[1], words[2] if len(words) > 2 else ""
+        elif cmd in ACTION_COMMANDS or timed:
+            name, shown, args = " ".join(part.replace('"', "").lower().split()), part, ""
+        else:
+            name, shown, args = cmd, words[0], part.split(None, 1)[1] if len(words) > 1 else ""
+        seen[name] += 1
+        if cmd in ACTION_COMMANDS or timed:
+            out[((name, seen[name]),)] = (shown, "", args)
+        else:
+            out[((name, 1),)] = (shown, "", args)  # set twice: the last one counts
+            out.move_to_end(((name, 1),))
     return out
 
 

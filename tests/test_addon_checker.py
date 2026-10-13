@@ -618,6 +618,14 @@ class Environment(Base):
         self.assertEqual(containers, [workshop, os.path.join(game, "hl2_complete", "custom"),
                                       os.path.join(game, "hl2", "custom")])
 
+    def test_search_paths_with_braces_in_comments_and_blocks(self):
+        text = ('"GameInfo"\n{\n FileSystem\n {\n  SearchPaths\n  {\n   // old } entries\n'
+                '   game+mod hl2_complete/a.vpk\n   Conditional { x y }\n   game |all_source_engine_paths|hl2/b.vpk\n'
+                '  }\n }\n}\n')
+        lines = [l.split() for l in ac.search_paths_block(text)]
+        self.assertEqual(lines, [["game+mod", "hl2_complete/a.vpk"], ["Conditional"], ["x", "y"],
+                                 ["game", "|all_source_engine_paths|hl2/b.vpk"]])
+
     def test_custom_fallback_without_gameinfo(self):
         lib, game, workshop = self.library(custom={"hl2": {"b": {"scripts/b.txt": "b"}},
                                                    "lostcoast": {"c": {"scripts/c.txt": "c"}}})

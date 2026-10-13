@@ -151,6 +151,11 @@ class Cfg(unittest.TestCase):
         self.assertIn('bind g "+use"', shown)
         self.assertEqual(shown.count("echo hi"), 2)
 
+    def test_timed_scripts_keep_every_step(self):
+        text = ("wait 5\nai_force_serverside_ragdoll 1\nent_fire a fireuser1\nwait 9\n"
+                "ent_fire a fireuser1\nai_force_serverside_ragdoll 0\n")
+        self.assertEqual(sc.format_cfg(sc.parse_cfg(text)), text.strip().splitlines())
+
     def test_quoted_and_unquoted_exec_are_the_same(self):
         old, new = sc.parse_cfg("exec skill.cfg\n"), sc.parse_cfg('exec "skill.cfg"\nexec "mine.cfg"\n')
         self.assertEqual(sc.describe(sc.diff_settings(old, new, False), "cfg"), ["+ exec mine.cfg"])
