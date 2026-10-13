@@ -247,7 +247,8 @@ class EndToEnd(Base):
         skill = "sk_plr_dmg_pistol 8\nsk_plr_dmg_smg1 4\n"
         lib, game, workshop = self.library(
             base_files={"scripts/weapon_pistol.txt": PISTOL.encode(), "cfg/skill.cfg": skill.encode(),
-                        "maps/town.bsp": bsp_bytes(ENTITIES), "sound/weapons/pistol/fire.wav": b"RIFF"},
+                        "maps/town.bsp": bsp_bytes(ENTITIES), "sound/weapons/pistol/fire.wav": b"RIFF",
+                        "scripts/game_sounds_new.txt": b'"Valve.Cut" { "wave" "weapons/never_shipped.wav" }'},
             items={"111": {"scripts/weapon_pistol.txt": PISTOL.replace('"18"', '"25"').replace('"8"', '"12"'),
                            "models/gun.mdl": "\0mdl", "materials/gun.vmt": '"VertexLitGeneric" {}'},
                    "222": {"pak.vpk": vpk_bytes({
@@ -255,7 +256,8 @@ class EndToEnd(Base):
                        "cfg/skill.cfg": b"sk_plr_dmg_pistol 8\nsk_plr_dmg_smg1 6\n",
                        "scripts/credits.txt": b"Made by someone"})},
                    "333": {"scripts/weapon_pistol.txt": PISTOL.replace('"18"', '"99"')},
-                   "666": {"scripts/game_sounds_new.txt": '"New.Shot" { "wave" "weapons/new.wav" }\n'
+                   "666": {"scripts/game_sounds_new.txt": '"Valve.Cut" { "wave" "weapons/never_shipped.wav" }\n'
+                                                           '"New.Shot" { "wave" "weapons/new.wav" }\n'
                                                            '"Old.Shot" { "wave" "^weapons/pistol/fire.wav" }\n'
                                                            '"Gone.Shot" { "wave" "weapons/gone.wav" }',
                            "sound/weapons/new.wav": "RIFF"},
@@ -329,10 +331,11 @@ class EndToEnd(Base):
         game = self.setup_install()
         code, out = self.run_tool("--game-dir", game)
         report = self.read("report.txt")
-        self.assertIn("Scripts that use sounds, models or materials the original game doesn't have:\n"
+        self.assertIn("Scripts that add sounds, models or materials the original game doesn't have:\n"
                       "  workshop/666: 2 files (1 its own, 1 missing)\n\n", report)
         self.assertIn("       sound/weapons/gone.wav  (missing)\n       sound/weapons/new.wav  (its own)", report)
         self.assertNotIn("pistol/fire.wav  (", report)  # the original game has it
+        self.assertNotIn("never_shipped", report)  # the original script already names it
         self.assertIn("1 addon's scripts use sounds", out)
         self.assertTrue(os.path.isfile(self.path("out", "combined", "scripts", "game_sounds_new.txt")))
 

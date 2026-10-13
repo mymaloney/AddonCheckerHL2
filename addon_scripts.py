@@ -656,6 +656,9 @@ def extract(addons, game_dir, out_dir, materials=False, progress=None, original_
     problems += ["original game: " + e for e in base_errors]
 
     # Which addons' scripts use sounds, models or materials the original game doesn't have.
+    # Only references an addon adds count: Valve's own scripts already name some sounds that
+    # were never shipped, and an addon that copies such a script doesn't need them any more.
+    parsed_base = {p: Parsed(p, d) for p, d in base.items()}
     parsed = {a: {p: Parsed(p, d) for p, d in texts[a].items()} for a in order}
     game_files = set(ac.read_base_game(game_dir, slow=None)[0]) if game_dir else None
     owner = {}
@@ -666,9 +669,10 @@ def extract(addons, game_dir, out_dir, materials=False, progress=None, original_
     if game_files:
         for a in order:
             refs = set()
-            for x in parsed[a].values():
+            for path, x in parsed[a].items():
                 if x.text is not None:
-                    refs |= asset_refs(x.text)
+                    orig = parsed_base.get(path)
+                    refs |= asset_refs(x.text) - (asset_refs(orig.text) if orig and orig.text else set())
             found = {r: (a if r in a.files else owner.get(r)) for r in sorted(refs) if r not in game_files}
             if found:
                 custom[a] = found
@@ -680,7 +684,6 @@ def extract(addons, game_dir, out_dir, materials=False, progress=None, original_
             shutil.rmtree(os.path.join(out_dir, sub), ignore_errors=True)
     os.makedirs(out_dir, exist_ok=True)
 
-    parsed_base = {p: Parsed(p, d) for p, d in base.items()}
     report = ["HL2 Addon Scripts %s" % ac.__version__,
               "Compared with: " + base_info, "",
               "What every addon changes in the game's scripts and settings, and one folder with all of",
@@ -690,7 +693,7 @@ def extract(addons, game_dir, out_dir, materials=False, progress=None, original_
         report.append("%3d. %s" % (n, label[a]))
     report.append("")
     if game_files is not None:
-        report.append("Scripts that use sounds, models or materials the original game doesn't have%s:" % (
+        report.append("Scripts that add sounds, models or materials the original game doesn't have%s:" % (
             " (left out of combined/)" if original_only else ""))
         for a, found in custom.items():
             report.append("  %s: %s" % (label[a], ref_summary(a, found)))
@@ -714,7 +717,7 @@ def extract(addons, game_dir, out_dir, materials=False, progress=None, original_
             report.append("   No scripts or settings.")
         if a in custom:
             found = custom[a]
-            report.append("   Uses files the original game doesn't have: " + ref_summary(a, found))
+            report.append("   Adds files the original game doesn't have: " + ref_summary(a, found))
             for ref in list(found)[:MAX_DIFF_LINES]:
                 who = found[ref]
                 report.append("       %s  (%s)" % (ref, "its own" if who is a else
